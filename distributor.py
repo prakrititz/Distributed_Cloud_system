@@ -105,8 +105,21 @@ class Distributor:
         print(f"[upload] '{name}': {len(data)} bytes -> {len(chunk_list)} chunk(s), "
               f"{self.replication_factor} copies each")
 
-        written = []   # (chunk_id, node): every copy stored so far, for rollback
-        placed = []    # ChunkInfo for the metadata
+        # Two lists, two jobs. Both are filled in the loop below.
+        #
+        # written: "what must I undo if this upload fails?"
+        #   One (chunk_id, node) entry per physical COPY stored on a node
+        #   (2 per chunk with replication factor 2). Holds node objects
+        #   because _rollback calls node.delete_chunk() on them. Only
+        #   _rollback reads it.
+        #
+        # placed: "what do I record in the metadata?"
+        #   One ChunkInfo per CHUNK, listing the node ids of its copies.
+        #   Only added once every copy of that chunk is stored. Only the
+        #   ObjectMetadata built at the end reads it; if the upload fails
+        #   it is simply thrown away.
+        written = []
+        placed = []
         for index, chunk in enumerate(chunk_list):
             chunk_id = f"{object_id}-{index}"
             targets = self._pick_nodes(len(chunk), self.replication_factor)
@@ -132,11 +145,11 @@ class Distributor:
                     raise RuntimeError(
                         f"Could not store a copy of chunk {index} on {node.node_id}"
                     )
-                written.append((chunk_id, node))
+                written.append((chunk_id, node))   # remember this copy for rollback
 
             replica_ids = [n.node_id for n in targets]
             print(f"[upload] chunk {index} ({len(chunk)} bytes) -> {', '.join(replica_ids)}")
-            placed.append(ChunkInfo(chunk_id, index, replica_ids))
+            placed.append(ChunkInfo(chunk_id, index, replica_ids))   # all copies stored: record the chunk
 
         self.metadata[object_id] = ObjectMetadata(
             object_id=object_id,
