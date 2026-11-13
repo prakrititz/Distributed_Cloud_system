@@ -1,42 +1,44 @@
-"""SerDe: converts a document to binary (and back). Reversible.
+"""SerDe: wraps raw file bytes with a header (and strips it again). Reversible.
+
+Works for any kind of file (documents, images, video, audio, archives, ...)
+because the content is treated as opaque bytes and never decoded.
 
 Binary layout:
-    [ 4 bytes  magic  b"DOC1" ]
+    [ 4 bytes  magic  b"OBJ1" ]
     [ 8 bytes  payload length (big-endian) ]
     [ 32 bytes SHA-256 of the payload ]
-    [ payload  the document, UTF-8 ]
+    [ payload  the file's bytes, unchanged ]
 The header lets deserialize() detect truncated or corrupted data.
 """
 
 import hashlib
 
-MAGIC = b"DOC1"
+MAGIC = b"OBJ1"
 LENGTH_SIZE = 8
 HASH_SIZE = 32
 HEADER_SIZE = len(MAGIC) + LENGTH_SIZE + HASH_SIZE
 
 
-def serialize(document: str) -> bytes:
-    """document (text) -> binary data (header + payload)."""
-    payload = document.encode("utf-8")
+def serialize(data: bytes) -> bytes:
+    """file bytes -> binary object (header + payload)."""
     header = (
         MAGIC
-        + len(payload).to_bytes(LENGTH_SIZE, "big")
-        + hashlib.sha256(payload).digest()
+        + len(data).to_bytes(LENGTH_SIZE, "big")
+        + hashlib.sha256(data).digest()
     )
-    return header + payload
+    return header + data
 
 
-def deserialize(data: bytes) -> str:
-    """binary data -> original document. Exact reverse of serialize().
+def deserialize(blob: bytes) -> bytes:
+    """binary object -> original file bytes. Exact reverse of serialize().
     Raises ValueError if the data is not valid or was corrupted."""
-    if len(data) < HEADER_SIZE or data[: len(MAGIC)] != MAGIC:
-        raise ValueError("Not a valid serialized document (bad header)")
+    if len(blob) < HEADER_SIZE or blob[: len(MAGIC)] != MAGIC:
+        raise ValueError("Not a valid serialized object (bad header)")
 
     length_end = len(MAGIC) + LENGTH_SIZE
-    length = int.from_bytes(data[len(MAGIC):length_end], "big")
-    expected_hash = data[length_end:HEADER_SIZE]
-    payload = data[HEADER_SIZE:]
+    length = int.from_bytes(blob[len(MAGIC):length_end], "big")
+    expected_hash = blob[length_end:HEADER_SIZE]
+    payload = blob[HEADER_SIZE:]
 
     if len(payload) != length:
         raise ValueError(
@@ -45,4 +47,4 @@ def deserialize(data: bytes) -> str:
     if hashlib.sha256(payload).digest() != expected_hash:
         raise ValueError("Checksum mismatch: data is corrupted")
 
-    return payload.decode("utf-8")
+    return payload
