@@ -1,15 +1,29 @@
 """Distributor: takes a client's request, splits data into chunks and
-decides which node stores each chunk. Also reassembles on download.
+decides which nodes store each chunk. Also reassembles on download.
 
 The distributor is the only component that knows the whole picture:
-which nodes exist, how full they are, and where every chunk of every
-object lives. Nodes just store bytes.
+which nodes exist, how full they are, and where every copy of every chunk
+of every object lives. Nodes just store bytes and never talk to each other.
+
+Replication: every chunk is stored on REPLICATION_FACTOR different nodes.
+The distributor writes each copy itself.
 """
 
 import uuid
 from dataclasses import dataclass, field
 
-CHUNK_SIZE = 1024 * 1024  # 1 MB, as the project spec says
+from node import NodeUnavailable
+
+CHUNK_SIZE = 1024 * 1024    # 1 MB, as the project spec says
+REPLICATION_FACTOR = 2      # copies of every chunk, each on a different node
+
+
+@dataclass
+class ChunkInfo:
+    """Where the copies of one chunk live."""
+    chunk_id: str
+    index: int                                  # position within the object
+    replicas: list = field(default_factory=list)  # node_ids holding a copy
 
 
 @dataclass
@@ -18,17 +32,21 @@ class ObjectMetadata:
     object_id: str
     name: str
     size: int
-    # list of (chunk_id, index, node_id), in order
-    chunks: list = field(default_factory=list)
+    chunks: list = field(default_factory=list)  # list of ChunkInfo, in order
 
 
 class Distributor:
-    def __init__(self, nodes: list, chunk_size: int = CHUNK_SIZE):
+    def __init__(self, nodes: list, chunk_size: int = CHUNK_SIZE,
+                 replication_factor: int = REPLICATION_FACTOR):
         self.nodes = nodes             # list of Node (the node registry, for now)
         self.chunk_size = chunk_size   # a parameter so we can test with tiny chunks
+        self.replication_factor = replication_factor
         self.metadata = {}             # object_id -> ObjectMetadata
         self.names = {}                # name -> object_id (what the client looks up by)
 
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
     def _split(self, data: bytes) -> list:
         """bytes -> list of chunks of at most chunk_size.
         Empty data still gives one (empty) chunk so the object has a record."""
@@ -36,13 +54,15 @@ class Distributor:
             return [b""]
         return [data[i:i + self.chunk_size] for i in range(0, len(data), self.chunk_size)]
 
-    def _pick_node(self, chunk_size: int):
-        """Choose the node with the most free space that can fit this chunk.
-        Ties go to the first node in the list. Return None if no node fits."""
-        candidates = [n for n in self.nodes if n.free_space() >= chunk_size]
-        if not candidates:
+    def _pick_nodes(self, chunk_size: int, count: int):
+        """Choose `count` DIFFERENT live nodes that can fit this chunk, most
+        free space first (ties keep node-list order). Returns the list, or
+        None if fewer than `count` nodes qualify."""
+        candidates = [n for n in self.nodes if n.alive and n.free_space() >= chunk_size]
+        if len(candidates) < count:
             return None
-        return max(candidates, key=lambda n: n.free_space())
+        candidates.sort(key=lambda n: -n.free_space())  # stable sort
+        return candidates[:count]
 
     def _get_node(self, node_id: str):
         """Find a node by its id."""
@@ -50,17 +70,30 @@ class Distributor:
             if node.node_id == node_id:
                 return node
         raise KeyError(f"Unknown node: {node_id}")
-    
+
+    def _rollback(self, written: list) -> None:
+        """Delete every copy stored so far by a failed upload."""
+        for chunk_id, node in written:
+            try:
+                node.delete_chunk(chunk_id)
+            except NodeUnavailable:
+                print(f"[upload] warning: {node.node_id} went down, "
+                      f"copy of {chunk_id} left behind")
+
+    # ------------------------------------------------------------------
+    # upload / download
+    # ------------------------------------------------------------------
     def upload(self, name: str, data: bytes) -> str:
-        """Split data, store each chunk on a node, record metadata.
-        Return the new object_id.
+        """Split data, store every chunk on REPLICATION_FACTOR different
+        nodes, record metadata. Return the new object_id.
 
         The client identifies an object by its name only. The object_id is
         internal: it is generated here, used to name the chunks, and only
-        becomes visible (name -> id map and metadata) once ALL chunks are
-        stored. If any chunk cannot be stored, the chunks already placed are
-        deleted and a RuntimeError is raised, so nothing half-uploaded is
-        left behind.
+        becomes visible (name -> id map and metadata) once ALL copies of ALL
+        chunks are stored. If any copy cannot be stored, every copy already
+        written is deleted and a RuntimeError is raised, so nothing
+        half-uploaded is left behind. (Strict: no chunk is ever stored with
+        fewer copies than the replication factor.)
 
         Raises FileExistsError if an object with this name already exists.
         """
@@ -69,35 +102,58 @@ class Distributor:
 
         object_id = str(uuid.uuid4())
         chunk_list = self._split(data)
-        print(f"[upload] '{name}': {len(data)} bytes -> {len(chunk_list)} chunk(s)")
+        print(f"[upload] '{name}': {len(data)} bytes -> {len(chunk_list)} chunk(s), "
+              f"{self.replication_factor} copies each")
 
-        placed = []  # (chunk_id, index, node) for rollback and metadata
+        written = []   # (chunk_id, node): every copy stored so far, for rollback
+        placed = []    # ChunkInfo for the metadata
         for index, chunk in enumerate(chunk_list):
             chunk_id = f"{object_id}-{index}"
-            node = self._pick_node(len(chunk))
+            targets = self._pick_nodes(len(chunk), self.replication_factor)
 
-            if node is None or not node.store_chunk(chunk_id, chunk):
-                print(f"[upload] no node can hold chunk {index} ({len(chunk)} bytes), rolling back")
-                for placed_id, _, placed_node in placed:
-                    placed_node.delete_chunk(placed_id)
-                raise RuntimeError("Not enough storage space across nodes")
+            if targets is None:
+                print(f"[upload] chunk {index}: fewer than {self.replication_factor} "
+                      f"live nodes have room for {len(chunk)} bytes, rolling back")
+                self._rollback(written)
+                raise RuntimeError(
+                    f"Not enough storage: need {self.replication_factor} different "
+                    f"live nodes with room for chunk {index}"
+                )
 
-            print(f"[upload] chunk {index} ({len(chunk)} bytes) -> {node.node_id}")
-            placed.append((chunk_id, index, node))
+            for node in targets:
+                try:
+                    stored = node.store_chunk(chunk_id, chunk)
+                except NodeUnavailable:
+                    stored = False
+                if not stored:
+                    print(f"[upload] chunk {index}: could not store a copy on "
+                          f"{node.node_id}, rolling back")
+                    self._rollback(written)
+                    raise RuntimeError(
+                        f"Could not store a copy of chunk {index} on {node.node_id}"
+                    )
+                written.append((chunk_id, node))
+
+            replica_ids = [n.node_id for n in targets]
+            print(f"[upload] chunk {index} ({len(chunk)} bytes) -> {', '.join(replica_ids)}")
+            placed.append(ChunkInfo(chunk_id, index, replica_ids))
 
         self.metadata[object_id] = ObjectMetadata(
             object_id=object_id,
             name=name,
             size=len(data),
-            chunks=[(cid, idx, node.node_id) for cid, idx, node in placed],
+            chunks=placed,
         )
         self.names[name] = object_id
         print(f"[upload] done, '{name}' -> object_id={object_id}")
         return object_id
 
     def download(self, name: str) -> bytes:
-        """Find the object by name, fetch its chunks from their nodes, join
-        in order. Raises KeyError if no object has that name."""
+        """Find the object by name, fetch each chunk from the first replica
+        that answers, join in order.
+
+        Raises KeyError if no object has that name, and RuntimeError if every
+        copy of some chunk is unavailable."""
         object_id = self.names.get(name)
         if object_id is None:
             raise KeyError(f"No object named '{name}'")
@@ -105,10 +161,76 @@ class Distributor:
         print(f"[download] '{name}' (object_id={object_id}): fetching {len(meta.chunks)} chunk(s)")
 
         pieces = []
-        for chunk_id, index, node_id in sorted(meta.chunks, key=lambda c: c[1]):
-            node = self._get_node(node_id)
-            print(f"[download] chunk {index} <- {node_id}")
-            pieces.append(node.get_chunk(chunk_id))
-
+        for info in sorted(meta.chunks, key=lambda c: c.index):
+            pieces.append(self._fetch_chunk(info))
         return b"".join(pieces)
-    
+
+    def _fetch_chunk(self, info: ChunkInfo) -> bytes:
+        """Try each replica in order; fall back to the next if one fails."""
+        for node_id in info.replicas:
+            node = self._get_node(node_id)
+            try:
+                data = node.get_chunk(info.chunk_id)
+            except NodeUnavailable:
+                print(f"[download] chunk {info.index}: {node_id} is down, trying next copy")
+                continue
+            except KeyError:
+                print(f"[download] chunk {info.index}: {node_id} lost the chunk, trying next copy")
+                continue
+            print(f"[download] chunk {info.index} <- {node_id}")
+            return data
+        raise RuntimeError(
+            f"All {len(info.replicas)} copies of chunk {info.index} are unavailable"
+        )
+
+    # ------------------------------------------------------------------
+    # health (read-only: detects problems, does not repair them)
+    # ------------------------------------------------------------------
+    def replication_report(self) -> dict:
+        """For every chunk of every object: which replicas are usable right
+        now (node up and chunk present), and whether the chunk still has the
+        required number of copies.
+
+        status per chunk:
+          healthy          usable copies >= replication factor
+          under_replicated 1 .. factor-1 usable copies (still downloadable)
+          unavailable      0 usable copies (download will fail)
+        """
+        chunks = []
+        counts = {"healthy": 0, "under_replicated": 0, "unavailable": 0}
+
+        for name, object_id in self.names.items():
+            meta = self.metadata[object_id]
+            for info in sorted(meta.chunks, key=lambda c: c.index):
+                replicas = []
+                for node_id in info.replicas:
+                    node = self._get_node(node_id)
+                    replicas.append({
+                        "node": node_id,
+                        "node_up": node.alive,
+                        "usable": node.has_chunk(info.chunk_id),
+                    })
+                usable = sum(1 for r in replicas if r["usable"])
+
+                if usable >= self.replication_factor:
+                    status = "healthy"
+                elif usable >= 1:
+                    status = "under_replicated"
+                else:
+                    status = "unavailable"
+                counts[status] += 1
+
+                chunks.append({
+                    "name": name,
+                    "index": info.index,
+                    "chunk_id": info.chunk_id,
+                    "usable_copies": usable,
+                    "status": status,
+                    "replicas": replicas,
+                })
+
+        return {
+            "replication_factor": self.replication_factor,
+            "summary": {"total_chunks": len(chunks), **counts},
+            "chunks": chunks,
+        }
