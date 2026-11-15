@@ -7,21 +7,31 @@ method sends one HTTP request to that node's server.
 It offers the same methods and attributes the distributor already uses, so
 distributor.py needs little or no change.
 
-Error mapping the distributor already understands:
+Error mapping the distributor understands:
     node unreachable / timeout / server error  -> raise NodeUnavailable
     chunk not found (404)                      -> raise KeyError
     no space (507)                             -> store_chunk returns False
     invalid chunk id (400)                     -> raise ValueError (a bug on
                                                   our side, not a node failure)
+    data fails its checksum                    -> raise ChunkCorrupt: a write
+                                                  the node rejected (422), or
+                                                  a stored chunk the node
+                                                  refuses to serve (409)
+
+Checksums: every chunk sent carries its checksum in the 'X-Checksum' header,
+so the node can refuse a chunk damaged on the way. Chunks received are NOT
+checked here: the distributor verifies every chunk it reads against the
+checksum it recorded at upload, which also covers damage on the way back.
 """
 import requests
 
+from checksum import compute
 from config import REQUEST_TIMEOUT
-from node import NodeUnavailable
+from node import ChunkCorrupt, NodeUnavailable
 
 
 class RemoteNode:
-    def __init__(self, node_id: str, base_url: str, timeout: float = REQUEST_TIMEOUT):
+    def __init__(self, node_id: str, base_url: str, timeout=REQUEST_TIMEOUT):
         self.node_id = node_id
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -84,26 +94,53 @@ class RemoteNode:
 
     # --- chunk operations ------------------------------------------------
     def store_chunk(self, chunk_id: str, data: bytes) -> bool:
-        """PUT the chunk's raw bytes. True if stored, False if the node has no
-        space. Raises NodeUnavailable if the node is unreachable."""
+        """PUT the chunk's raw bytes together with their checksum. True if
+        stored, False if the node has no space. Raises NodeUnavailable if the
+        node is unreachable, ChunkCorrupt if the node says the bytes arrived
+        damaged (nothing is stored then)."""
         response = self._request(
             "PUT", f"/internal/chunks/{chunk_id}",
-            data=data, headers={"Content-Type": "application/octet-stream"},
+            data=data,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "X-Checksum": compute(data),   # the node verifies this on arrival
+            },
         )
         if response.status_code == 201:
             return True
         if response.status_code == 507:
             return False
+        if response.status_code == 422:
+            raise ChunkCorrupt(f"{self.node_id} received chunk '{chunk_id}' damaged in transit")
         if response.status_code == 400:
             raise ValueError(response.json().get("error", "invalid chunk id"))
         raise self._unexpected(response)
 
     def get_chunk(self, chunk_id: str) -> bytes:
         """GET the chunk's bytes. Raises KeyError if the node doesn't have it,
-        NodeUnavailable if it can't be reached."""
+        NodeUnavailable if it can't be reached, ChunkCorrupt if the node
+        reports its stored copy is damaged. The bytes themselves are not
+        verified here; the caller (the distributor) checks them against the
+        checksum it recorded at upload."""
         response = self._request("GET", f"/internal/chunks/{chunk_id}")
         if response.status_code == 200:
             return response.content
+        if response.status_code == 404:
+            raise KeyError(chunk_id)
+        if response.status_code == 409:
+            raise ChunkCorrupt(f"{self.node_id} reports its copy of chunk '{chunk_id}' is damaged")
+        if response.status_code == 400:
+            raise ValueError(response.json().get("error", "invalid chunk id"))
+        raise self._unexpected(response)
+
+    def get_checksum(self, chunk_id: str) -> dict:
+        """Ask the node to recompute the checksum of a stored chunk without
+        sending the chunk. Returns {chunk_id, checksum, stored, ok}. Raises
+        KeyError if the node doesn't have it, NodeUnavailable if unreachable.
+        (For scans and the health report; not used by upload or download.)"""
+        response = self._request("GET", f"/internal/chunks/{chunk_id}/checksum")
+        if response.status_code == 200:
+            return response.json()
         if response.status_code == 404:
             raise KeyError(chunk_id)
         if response.status_code == 400:

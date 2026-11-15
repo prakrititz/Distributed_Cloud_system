@@ -19,7 +19,8 @@ import os
 
 from flask import Flask, Response, request, jsonify
 
-from node import ChunkStore
+from checksum import compute, verify
+from node import ChunkCorrupt, ChunkStore
 
 app = Flask(__name__)
 
@@ -39,11 +40,21 @@ def error(message: str, status: int):
 
 @app.route("/internal/chunks/<chunk_id>", methods=["PUT"])
 def put_chunk(chunk_id):
-    """Store a chunk. The request body is the raw bytes.
-    201 on success, 507 if there is no space, 400 for a bad chunk_id.
-    Storing an id that already exists replaces it.
+    """Store a chunk. The request body is the raw bytes and the 'X-Checksum'
+    header is the sender's checksum of them.
+    201 on success, 507 if there is no space, 400 for a bad chunk_id or a
+    missing header, 422 if the bytes don't match the checksum (damaged in
+    transit: nothing is stored). Storing an id that already exists replaces it.
     """
+    expected = request.headers.get("X-Checksum")
+    if not expected:
+        return error("Missing 'X-Checksum' header", 400)
+
     data = request.get_data()
+    # Check B (distributor -> node): refuse a chunk damaged on the way here.
+    if not verify(data, expected):
+        return error(f"{NODE_ID}: checksum mismatch, chunk '{chunk_id}' was damaged in transit", 422)
+
     try:
         stored = store.store(chunk_id, data)
     except ValueError as e:
@@ -60,21 +71,51 @@ def put_chunk(chunk_id):
 
 @app.route("/internal/chunks/<chunk_id>", methods=["GET", "HEAD"])
 def get_chunk(chunk_id):
-    """Return the chunk's raw bytes (application/octet-stream).
-    404 if this node doesn't have it, 400 for a bad chunk_id.
-    HEAD answers 200 or 404 without sending the data: the cheap way to ask
-    'do you have this chunk?'.
+    """Return the chunk's raw bytes (application/octet-stream), with their
+    checksum in the 'X-Checksum' header so the receiver can verify them.
+    404 if this node doesn't have it, 400 for a bad chunk_id, 409 if the
+    stored chunk no longer matches its checksum (damaged on disk: it is NOT
+    sent). HEAD answers 200 or 404 without sending the data: the cheap way to
+    ask 'do you have this chunk?'.
     """
     try:
         if request.method == "HEAD":
             return Response(status=200 if store.has(chunk_id) else 404)
-        data = store.get(chunk_id)
+        data = store.get(chunk_id)   # checks the chunk against its stored checksum
+    except ValueError as e:
+        return error(str(e), 400)
+    except KeyError:
+        return error(f"{NODE_ID} has no chunk '{chunk_id}'", 404)
+    except ChunkCorrupt as e:
+        print(f"[{NODE_ID}] CORRUPT chunk {chunk_id}: refusing to serve it")
+        return error(f"{NODE_ID}: {e}", 409)
+
+    response = Response(data, mimetype="application/octet-stream")
+    response.headers["X-Checksum"] = compute(data)
+    return response
+
+
+@app.route("/internal/chunks/<chunk_id>/checksum", methods=["GET"])
+def chunk_checksum(chunk_id):
+    """Recompute the checksum of a stored chunk right now, without sending the
+    chunk itself, and compare it with the one saved at write time.
+    Returns {chunk_id, checksum, stored, ok}. 404 if absent, 400 for a bad id.
+    ('ok' is true when there is nothing to compare against.)
+    """
+    try:
+        actual = store.compute_checksum(chunk_id)
+        stored = store.stored_checksum(chunk_id)
     except ValueError as e:
         return error(str(e), 400)
     except KeyError:
         return error(f"{NODE_ID} has no chunk '{chunk_id}'", 404)
 
-    return Response(data, mimetype="application/octet-stream")
+    return jsonify({
+        "chunk_id": chunk_id,
+        "checksum": actual,
+        "stored": stored,
+        "ok": stored is None or actual == stored,
+    })
 
 
 @app.route("/internal/chunks/<chunk_id>", methods=["DELETE"])
