@@ -8,6 +8,10 @@ of every object lives. Nodes just store bytes and never talk to each other.
 Replication: every chunk is stored on REPLICATION_FACTOR different nodes.
 The distributor writes each copy itself.
 
+Objects are identified by an object_id the distributor generates. The file
+name is only metadata and is not unique; what makes an upload a duplicate is
+its source_path (where the client read the file from).
+
 The nodes it is given are RemoteNode objects (remote_node.py): every call on
 them is an HTTP request to that node's server. The distributor only relies on
 these methods: health(), alive, store_chunk(), get_chunk(), has_chunk() and
@@ -17,12 +21,19 @@ delete_chunk().
 import threading
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from checksum import compute, verify
 from node import ChunkCorrupt, NodeUnavailable
 
 CHUNK_SIZE = 1024 * 1024    # 1 MB, as the project spec says
 REPLICATION_FACTOR = 2      # copies of every chunk, each on a different node
+DEFAULT_CONTENT_TYPE = "application/octet-stream"
+
+
+def _now() -> str:
+    """Current time in UTC as an ISO 8601 string, e.g. 2026-11-15T10:12:03Z."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @dataclass
@@ -39,12 +50,18 @@ class ChunkInfo:
 
 @dataclass
 class ObjectMetadata:
-    """Kept as a separate object so it can be moved/exposed later."""
+    """Everything the system knows about one object. Kept as a separate object
+    so it can be moved/exposed later."""
     object_id: str
-    name: str
-    size: int
+    name: str                                   # file name, for display; NOT unique
+    size: int                                   # size of the original object, bytes
     chunks: list = field(default_factory=list)  # list of ChunkInfo, in order
     checksum: str = ""                          # checksum of the whole object
+    content_type: str = DEFAULT_CONTENT_TYPE
+    created_at: str = ""
+    modified_at: str = ""                       # changes when custom metadata is patched
+    custom: dict = field(default_factory=dict)  # user-defined key-value metadata
+    source_path: str = ""                       # where the client read the file; unique
 
 
 class Distributor:
@@ -54,9 +71,10 @@ class Distributor:
         self.chunk_size = chunk_size   # a parameter so we can test with tiny chunks
         self.replication_factor = replication_factor
         self.metadata = {}             # object_id -> ObjectMetadata
-        self.names = {}                # name -> object_id (what the client looks up by)
+        self.paths = {}                # source_path -> object_id (duplicate check)
         # The web server handles requests on several threads. This lock makes
-        # "check the name is free, then register it" one step.
+        # "check the path is free, then register the object" one step, and
+        # protects changes to an object's metadata.
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -108,25 +126,40 @@ class Distributor:
                 print(f"[upload] warning: {node.node_id} went down, "
                       f"copy of {chunk_id} left behind")
 
+    @staticmethod
+    def _duplicate_message(source_path: str, existing_id: str) -> str:
+        return (f"An object uploaded from '{source_path}' already exists "
+                f"(object_id {existing_id}); delete it first to upload it again")
+
     # ------------------------------------------------------------------
     # upload / download
     # ------------------------------------------------------------------
-    def upload(self, name: str, data: bytes) -> str:
+    def upload(self, name: str, data: bytes, content_type: str = DEFAULT_CONTENT_TYPE,
+               custom: dict = None, source_path: str = None, size: int = None) -> str:
         """Split data, store every chunk on REPLICATION_FACTOR different
         nodes, record metadata. Return the new object_id.
 
-        The client identifies an object by its name only. The object_id is
-        internal: it is generated here, used to name the chunks, and only
-        becomes visible (name -> id map and metadata) once ALL copies of ALL
+        name         file name, kept as metadata (several objects can share it)
+        content_type e.g. 'video/mp4'
+        custom       user-defined key-value metadata
+        source_path  where the client read the file from. Two uploads with the
+                     same source_path are the same file, so the second is
+                     refused. Optional: without it, nothing is checked.
+        size         size of the original object if it differs from len(data)
+                     (e.g. the client wraps the file in a header); defaults to
+                     len(data)
+
+        The object_id is generated here, used to name the chunks, and only
+        becomes visible (metadata and path index) once ALL copies of ALL
         chunks are stored. If any copy cannot be stored, every copy already
         written is deleted and a RuntimeError is raised, so nothing
         half-uploaded is left behind. (Strict: no chunk is ever stored with
         fewer copies than the replication factor.)
 
-        Raises FileExistsError if an object with this name already exists.
+        Raises FileExistsError if an object from this source_path exists.
         """
-        if name in self.names:
-            raise FileExistsError(f"An object named '{name}' already exists")
+        if source_path and source_path in self.paths:
+            raise FileExistsError(self._duplicate_message(source_path, self.paths[source_path]))
 
         object_id = str(uuid.uuid4())
         chunk_list = self._split(data)
@@ -177,20 +210,28 @@ class Distributor:
                 # copy must match when it is read back
                 placed.append(ChunkInfo(chunk_id, index, replica_ids, compute(chunk)))
 
-            # Register the object. Done under the lock, and the name is checked
-            # again: another upload with the same name may have finished while
+            # Register the object. Done under the lock, and the path is checked
+            # again: another upload of the same file may have finished while
             # this one was storing chunks.
             with self._lock:
-                if name in self.names:
-                    raise FileExistsError(f"An object named '{name}' already exists")
+                if source_path and source_path in self.paths:
+                    raise FileExistsError(
+                        self._duplicate_message(source_path, self.paths[source_path]))
+                now = _now()
                 self.metadata[object_id] = ObjectMetadata(
                     object_id=object_id,
                     name=name,
-                    size=len(data),
+                    size=len(data) if size is None else size,
                     chunks=placed,
                     checksum=object_checksum,
+                    content_type=content_type or DEFAULT_CONTENT_TYPE,
+                    created_at=now,
+                    modified_at=now,
+                    custom=dict(custom or {}),
+                    source_path=source_path or "",
                 )
-                self.names[name] = object_id
+                if source_path:
+                    self.paths[source_path] = object_id
         except Exception as e:
             # Whatever went wrong (no space, a node died, a bug), never leave
             # copies behind that no metadata points to.
@@ -201,30 +242,27 @@ class Distributor:
         print(f"[upload] done, '{name}' -> object_id={object_id}")
         return object_id
 
-    def download(self, name: str) -> bytes:
-            """Find the object by name, fetch each chunk from the first replica
-            that is up AND intact, join in order.
+    def download(self, object_id: str) -> bytes:
+        """Fetch each chunk of the object from the first replica that is up AND
+        intact, join in order.
 
-            Every copy read from a node is checked against the checksum recorded
-            at upload; a damaged copy is skipped like a missing one. The joined
-            result is checked against the whole-object checksum as a last step.
+        Every copy read from a node is checked against the checksum recorded
+        at upload; a damaged copy is skipped like a missing one. The joined
+        result is checked against the whole-object checksum as a last step.
 
-            Raises KeyError if no object has that name, and RuntimeError if no
-            good copy of some chunk can be found."""
-            object_id = self.names.get(name)
-            if object_id is None:
-                raise KeyError(f"No object named '{name}'")
-            meta = self.metadata[object_id]
-            print(f"[download] '{name}' (object_id={object_id}): fetching {len(meta.chunks)} chunk(s)")
+        Raises KeyError if there is no such object, and RuntimeError if no
+        good copy of some chunk can be found."""
+        meta = self.get_object(object_id)
+        print(f"[download] '{meta.name}' (object_id={object_id}): fetching {len(meta.chunks)} chunk(s)")
 
-            pieces = []
-            for info in sorted(meta.chunks, key=lambda c: c.index):
-                pieces.append(self._fetch_chunk(info))
-            result = b"".join(pieces)
+        pieces = []
+        for info in sorted(meta.chunks, key=lambda c: c.index):
+            pieces.append(self._fetch_chunk(info))
+        result = b"".join(pieces)
 
-            if not verify(result, meta.checksum):
-                raise RuntimeError(f"'{name}' failed the whole-object checksum after reassembly")
-            return result
+        if not verify(result, meta.checksum):
+            raise RuntimeError(f"Object '{object_id}' failed the whole-object checksum after reassembly")
+        return result
 
     def _fetch_chunk(self, info: ChunkInfo) -> bytes:
         """Try each replica in order; fall back to the next if one is down,
@@ -250,7 +288,7 @@ class Distributor:
 
             if not verify(data, info.checksum):
                 print(f"[download] chunk {info.index}: copy on {node_id} is CORRUPT "
-                    f"(checksum mismatch), trying next copy")
+                      f"(checksum mismatch), trying next copy")
                 problems.append((node_id, "corrupt"))
                 continue
 
@@ -259,6 +297,60 @@ class Distributor:
 
         details = ", ".join(f"{n}: {why}" for n, why in problems)
         raise RuntimeError(f"No good copy of chunk {info.index} ({details})")
+
+    # ------------------------------------------------------------------
+    # metadata, delete, list
+    # ------------------------------------------------------------------
+    def get_object(self, object_id: str) -> ObjectMetadata:
+        """The metadata of one object. Raises KeyError if there is none."""
+        meta = self.metadata.get(object_id)
+        if meta is None:
+            raise KeyError(f"No object with id '{object_id}'")
+        return meta
+
+    def list_objects(self) -> list:
+        """All objects' metadata, oldest first."""
+        return sorted(list(self.metadata.values()), key=lambda m: (m.created_at, m.object_id))
+
+    def update_custom_metadata(self, object_id: str, updates: dict) -> ObjectMetadata:
+        """Add or change custom key-value metadata, without touching the stored
+        data. A value of None removes that key. Updates modified_at. Raises
+        KeyError if there is no such object."""
+        with self._lock:
+            meta = self.get_object(object_id)
+            for key, value in updates.items():
+                if value is None:
+                    meta.custom.pop(key, None)
+                else:
+                    meta.custom[key] = value
+            meta.modified_at = _now()
+            return meta
+
+    def delete(self, object_id: str) -> list:
+        """Delete an object and every copy of its chunks. Raises KeyError if
+        there is no such object.
+
+        The metadata goes first, so the object is gone for clients at once; then
+        each copy is removed from its node. A copy on a node that cannot be
+        reached is left behind (an orphan); those are returned as a list of
+        (node_id, chunk_id) and printed."""
+        with self._lock:
+            meta = self.get_object(object_id)
+            del self.metadata[object_id]
+            if meta.source_path and self.paths.get(meta.source_path) == object_id:
+                del self.paths[meta.source_path]
+
+        left_behind = []
+        for info in meta.chunks:
+            for node_id in info.replicas:
+                try:
+                    self._get_node(node_id).delete_chunk(info.chunk_id)
+                except NodeUnavailable:
+                    left_behind.append((node_id, info.chunk_id))
+
+        print(f"[delete] '{meta.name}' (object_id={object_id}) removed"
+              + (f"; {len(left_behind)} copy/copies left on unreachable nodes" if left_behind else ""))
+        return left_behind
 
     # ------------------------------------------------------------------
     # health (read-only: detects problems, does not repair them)
@@ -281,8 +373,7 @@ class Distributor:
 
         # list(...): an upload finishing meanwhile must not change the dict
         # while we loop over it.
-        for name, object_id in list(self.names.items()):
-            meta = self.metadata[object_id]
+        for meta in list(self.metadata.values()):
             for info in sorted(meta.chunks, key=lambda c: c.index):
                 replicas = []
                 for node_id in info.replicas:
@@ -304,7 +395,8 @@ class Distributor:
                 counts[status] += 1
 
                 chunks.append({
-                    "name": name,
+                    "object_id": meta.object_id,
+                    "name": meta.name,
                     "index": info.index,
                     "chunk_id": info.chunk_id,
                     "usable_copies": usable,

@@ -1,18 +1,23 @@
 """Flask app: the client-facing API. It owns the distributor, which talks to
 the node servers (node_server.py) over HTTP through RemoteNode objects.
 
-The client identifies an object by its name only. Object IDs stay internal.
+Objects are identified by the object_id returned from an upload. The file name
+is only metadata: several objects can share it.
 
 Start the 4 node servers first (see node_server.py), then this app. Each
 node's capacity is set on its own server (CAPACITY), not here.
 """
 import io
+import json
+import mimetypes
+import os
 
 from flask import Flask, request, jsonify, send_file
+from werkzeug.exceptions import HTTPException
 
 from checksum import compute, verify
 from config import NODE_ADDRESSES
-from distributor import Distributor
+from distributor import DEFAULT_CONTENT_TYPE, Distributor
 from node import NodeUnavailable
 from remote_node import RemoteNode
 
@@ -30,86 +35,206 @@ def error(message: str, status: int):
     return jsonify({"error": message}), status
 
 
+@app.errorhandler(HTTPException)
+def handle_http_error(e):
+    """Flask's own errors (unknown URL, wrong method, ...) as JSON too."""
+    return error(e.description, e.code)
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(e):
+    """Anything unexpected: log it, answer with JSON instead of an HTML page."""
+    app.logger.exception("Unhandled error")
+    return error("Internal server error", 500)
+
+
+def parse_custom(value, what: str) -> dict:
+    """Check that `value` is a JSON object of key-value pairs, with string keys
+    and string/number/boolean/null values. Raises ValueError if not."""
+    if not isinstance(value, dict):
+        raise ValueError(f"{what} must be a JSON object of key-value pairs")
+    for key, val in value.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"{what}: keys must be non-empty strings")
+        if val is not None and not isinstance(val, (str, int, float, bool)):
+            raise ValueError(f"{what}: the value of '{key}' must be a string, number, boolean or null")
+    return value
+
+
+def object_json(meta) -> dict:
+    """An object's full metadata as JSON: what the system keeps (size, type,
+    times, checksum, where every chunk copy lives) plus the custom metadata."""
+    return {
+        "object_id": meta.object_id,
+        "name": meta.name,
+        "size": meta.size,
+        "content_type": meta.content_type,
+        "created_at": meta.created_at,
+        "modified_at": meta.modified_at,
+        "checksum": meta.checksum,
+        "source_path": meta.source_path,
+        "chunk_count": len(meta.chunks),
+        "copies_per_chunk": distributor.replication_factor,
+        "chunks": [
+            {"index": c.index, "chunk_id": c.chunk_id, "checksum": c.checksum, "replicas": c.replicas}
+            for c in sorted(meta.chunks, key=lambda c: c.index)
+        ],
+        "custom": meta.custom,
+    }
+
+
 @app.route("/api/v1/objects", methods=["POST"])
 def upload_object():
-    """Receive a file (multipart field 'file') and its checksum (form field
-    'checksum'), verify the file, then pass it to distributor.upload.
-    Return JSON with name, object_id, size, number of chunks. Status 201.
-    400 if no file / empty name / no checksum / checksum mismatch (the upload
-    was damaged in transit, nothing is stored), 409 if the name exists, 503 if
-    there is not enough space on enough live nodes to store every chunk twice.
+    """Upload an object (multipart/form-data).
+
+    Fields: 'file' (required) and, all optional:
+      'metadata'  JSON object of custom key-value metadata
+      'checksum'  checksum of the file; verified before anything is stored
+      'path'      where the client read the file from. Two uploads from the
+                  same path are the same file, so the second is refused
+      'size'      size of the original object, if the uploaded bytes are a
+                  wrapped form of it (defaults to the uploaded size)
+
+    201 with the new object's metadata. 400 for a bad field or a checksum
+    mismatch (nothing is stored), 409 if an object from this path exists,
+    503 if there is not enough space on enough live nodes to store every
+    chunk twice.
     """
     file = request.files.get("file")
     if file is None or not file.filename:
         return error("Missing 'file' field in the multipart upload", 400)
 
-    expected = request.form.get("checksum")
-    if not expected:
-        return error("Missing 'checksum' field in the multipart upload", 400)
-
-    name = file.filename
     data = file.read()
+    name = os.path.basename(file.filename.replace("\\", "/"))
 
-    # Check A (client -> server): the bytes that arrived must match the
-    # checksum the client computed before sending. Reject before storing.
-    if not verify(data, expected):
+    # Check A (client -> server): if the client sent a checksum, the bytes that
+    # arrived must match it. Reject before storing anything.
+    expected = request.form.get("checksum")
+    if expected and not verify(data, expected):
         return error("Checksum mismatch: the upload was damaged in transit", 400)
 
+    # content type: what the client said, else guessed from the file name
+    content_type = file.mimetype
+    if not content_type or content_type == DEFAULT_CONTENT_TYPE:
+        content_type = mimetypes.guess_type(name)[0] or DEFAULT_CONTENT_TYPE
+
     try:
-        object_id = distributor.upload(name, data)
+        custom = {}
+        if request.form.get("metadata"):
+            try:
+                raw = json.loads(request.form["metadata"])
+            except ValueError:
+                raise ValueError("'metadata' must be valid JSON")
+            custom = {k: v for k, v in parse_custom(raw, "'metadata'").items() if v is not None}
+
+        size = None
+        if request.form.get("size"):
+            try:
+                size = int(request.form["size"])
+            except ValueError:
+                raise ValueError("'size' must be an integer")
+            if size < 0:
+                raise ValueError("'size' must not be negative")
+    except ValueError as e:
+        return error(str(e), 400)
+
+    try:
+        object_id = distributor.upload(
+            name, data, content_type=content_type, custom=custom,
+            source_path=request.form.get("path") or None, size=size,
+        )
     except FileExistsError as e:
         return error(str(e), 409)
     except RuntimeError as e:
         return error(str(e), 503)
 
-    meta = distributor.metadata[object_id]
-    return jsonify({
-        "name": meta.name,
-        "object_id": object_id,
-        "size": meta.size,
-        "chunks": len(meta.chunks),
-        "copies_per_chunk": distributor.replication_factor,
-    }), 201
+    return jsonify(object_json(distributor.get_object(object_id))), 201
 
 
-@app.route("/api/v1/objects/<name>", methods=["GET"])
-def download_object(name):
-    """Ask distributor.download for the bytes and send them back, with their
-    checksum in the 'X-Checksum' header so the client can verify them.
-    404 if no object has that name, 503 if every copy of a chunk is down.
-    """
-    if name not in distributor.names:
-        return error(f"No object named '{name}'", 404)
-
+@app.route("/api/v1/objects", methods=["GET"])
+def list_objects():
+    """List the stored objects (object_id, name, size, content_type and times),
+    oldest first. Optional 'limit' and 'offset' query parameters paginate; the
+    total number of objects is in the 'X-Total-Count' header."""
     try:
-        data = distributor.download(name)
+        offset = int(request.args.get("offset", 0))
+        limit = request.args.get("limit")
+        limit = None if limit is None else int(limit)
+        if offset < 0 or (limit is not None and limit < 0):
+            raise ValueError
+    except ValueError:
+        return error("'limit' and 'offset' must be non-negative integers", 400)
+
+    objects = distributor.list_objects()
+    page = objects[offset:] if limit is None else objects[offset:offset + limit]
+    response = jsonify([
+        {
+            "object_id": m.object_id,
+            "name": m.name,
+            "size": m.size,
+            "content_type": m.content_type,
+            "created_at": m.created_at,
+            "modified_at": m.modified_at,
+        }
+        for m in page
+    ])
+    response.headers["X-Total-Count"] = str(len(objects))
+    return response
+
+
+@app.route("/api/v1/objects/<object_id>", methods=["GET"])
+def download_object(object_id):
+    """Send the object's bytes back with its content type, and their checksum
+    in the 'X-Checksum' header so the client can verify them.
+    404 if there is no such object, 503 if no good copy of a chunk is left.
+    """
+    try:
+        meta = distributor.get_object(object_id)
+        data = distributor.download(object_id)
+    except KeyError:
+        return error(f"No object with id '{object_id}'", 404)
     except RuntimeError as e:
         return error(str(e), 503)
 
-    response = send_file(io.BytesIO(data), mimetype="application/octet-stream")
+    response = send_file(io.BytesIO(data), mimetype=meta.content_type)
     response.headers["X-Checksum"] = compute(data)
     return response
 
 
-@app.route("/api/v1/objects/<name>/chunks", methods=["GET"])
-def show_distribution(name):
-    """Debug endpoint (our own, not in the spec): return which nodes hold
-    each chunk's copies, so we can SEE how the distributor spread the file.
-    """
-    object_id = distributor.names.get(name)
-    if object_id is None:
-        return error(f"No object named '{name}'", 404)
+@app.route("/api/v1/objects/<object_id>/metadata", methods=["GET"])
+def get_metadata(object_id):
+    """The object's metadata, without downloading its data. 404 if unknown."""
+    try:
+        return jsonify(object_json(distributor.get_object(object_id)))
+    except KeyError:
+        return error(f"No object with id '{object_id}'", 404)
 
-    meta = distributor.metadata[object_id]
-    return jsonify({
-        "name": meta.name,
-        "object_id": meta.object_id,
-        "size": meta.size,
-        "chunks": [
-            {"index": c.index, "chunk_id": c.chunk_id, "replicas": c.replicas}
-            for c in sorted(meta.chunks, key=lambda c: c.index)
-        ],
-    })
+
+@app.route("/api/v1/objects/<object_id>/metadata", methods=["PATCH"])
+def update_metadata(object_id):
+    """Add or update custom metadata. The body is a JSON object of key-value
+    pairs; a null value removes that key. The stored data is not touched.
+    400 for a bad body, 404 if unknown. Returns the updated metadata."""
+    try:
+        updates = parse_custom(request.get_json(silent=True), "The request body")
+    except ValueError as e:
+        return error(str(e), 400)
+
+    try:
+        meta = distributor.update_custom_metadata(object_id, updates)
+    except KeyError:
+        return error(f"No object with id '{object_id}'", 404)
+    return jsonify(object_json(meta))
+
+
+@app.route("/api/v1/objects/<object_id>", methods=["DELETE"])
+def delete_object(object_id):
+    """Delete the object and every copy of its chunks. 204, or 404 if unknown."""
+    try:
+        distributor.delete(object_id)
+    except KeyError:
+        return error(f"No object with id '{object_id}'", 404)
+    return "", 204
 
 
 @app.route("/api/v1/nodes", methods=["GET"])
