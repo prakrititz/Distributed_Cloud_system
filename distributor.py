@@ -18,7 +18,8 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 
-from node import NodeUnavailable
+from checksum import compute, verify
+from node import ChunkCorrupt, NodeUnavailable
 
 CHUNK_SIZE = 1024 * 1024    # 1 MB, as the project spec says
 REPLICATION_FACTOR = 2      # copies of every chunk, each on a different node
@@ -26,10 +27,14 @@ REPLICATION_FACTOR = 2      # copies of every chunk, each on a different node
 
 @dataclass
 class ChunkInfo:
-    """Where the copies of one chunk live."""
+    """Where the copies of one chunk live, and what they must contain."""
     chunk_id: str
     index: int                                  # position within the object
     replicas: list = field(default_factory=list)  # node_ids holding a copy
+    # Checksum of the chunk's bytes, computed when the file was split. The
+    # distributor's own record is the authority: every copy read back from a
+    # node must match it.
+    checksum: str = ""
 
 
 @dataclass
@@ -39,6 +44,7 @@ class ObjectMetadata:
     name: str
     size: int
     chunks: list = field(default_factory=list)  # list of ChunkInfo, in order
+    checksum: str = ""                          # checksum of the whole object
 
 
 class Distributor:
@@ -124,6 +130,7 @@ class Distributor:
 
         object_id = str(uuid.uuid4())
         chunk_list = self._split(data)
+        object_checksum = compute(data)   # fingerprint of the whole object
         print(f"[upload] '{name}': {len(data)} bytes -> {len(chunk_list)} chunk(s), "
               f"{self.replication_factor} copies each")
 
@@ -156,8 +163,8 @@ class Distributor:
                 for node in targets:
                     try:
                         stored = node.store_chunk(chunk_id, chunk)
-                    except NodeUnavailable:
-                        stored = False
+                    except (NodeUnavailable, ChunkCorrupt):
+                        stored = False   # down, or the chunk arrived damaged
                     if not stored:
                         raise RuntimeError(
                             f"Could not store a copy of chunk {index} on {node.node_id}"
@@ -166,7 +173,9 @@ class Distributor:
 
                 replica_ids = [n.node_id for n in targets]
                 print(f"[upload] chunk {index} ({len(chunk)} bytes) -> {', '.join(replica_ids)}")
-                placed.append(ChunkInfo(chunk_id, index, replica_ids))   # all copies stored: record the chunk
+                # all copies stored: record the chunk, with the checksum every
+                # copy must match when it is read back
+                placed.append(ChunkInfo(chunk_id, index, replica_ids, compute(chunk)))
 
             # Register the object. Done under the lock, and the name is checked
             # again: another upload with the same name may have finished while
@@ -179,6 +188,7 @@ class Distributor:
                     name=name,
                     size=len(data),
                     chunks=placed,
+                    checksum=object_checksum,
                 )
                 self.names[name] = object_id
         except Exception as e:
@@ -192,39 +202,63 @@ class Distributor:
         return object_id
 
     def download(self, name: str) -> bytes:
-        """Find the object by name, fetch each chunk from the first replica
-        that answers, join in order.
+            """Find the object by name, fetch each chunk from the first replica
+            that is up AND intact, join in order.
 
-        Raises KeyError if no object has that name, and RuntimeError if every
-        copy of some chunk is unavailable."""
-        object_id = self.names.get(name)
-        if object_id is None:
-            raise KeyError(f"No object named '{name}'")
-        meta = self.metadata[object_id]
-        print(f"[download] '{name}' (object_id={object_id}): fetching {len(meta.chunks)} chunk(s)")
+            Every copy read from a node is checked against the checksum recorded
+            at upload; a damaged copy is skipped like a missing one. The joined
+            result is checked against the whole-object checksum as a last step.
 
-        pieces = []
-        for info in sorted(meta.chunks, key=lambda c: c.index):
-            pieces.append(self._fetch_chunk(info))
-        return b"".join(pieces)
+            Raises KeyError if no object has that name, and RuntimeError if no
+            good copy of some chunk can be found."""
+            object_id = self.names.get(name)
+            if object_id is None:
+                raise KeyError(f"No object named '{name}'")
+            meta = self.metadata[object_id]
+            print(f"[download] '{name}' (object_id={object_id}): fetching {len(meta.chunks)} chunk(s)")
+
+            pieces = []
+            for info in sorted(meta.chunks, key=lambda c: c.index):
+                pieces.append(self._fetch_chunk(info))
+            result = b"".join(pieces)
+
+            if not verify(result, meta.checksum):
+                raise RuntimeError(f"'{name}' failed the whole-object checksum after reassembly")
+            return result
 
     def _fetch_chunk(self, info: ChunkInfo) -> bytes:
-        """Try each replica in order; fall back to the next if one fails."""
+        """Try each replica in order; fall back to the next if one is down,
+        has lost the chunk, or returns data that fails the checksum."""
+        problems = []   # (node_id, what was wrong), for the error message
         for node_id in info.replicas:
             node = self._get_node(node_id)
             try:
                 data = node.get_chunk(info.chunk_id)
             except NodeUnavailable:
                 print(f"[download] chunk {info.index}: {node_id} is down, trying next copy")
+                problems.append((node_id, "down"))
                 continue
             except KeyError:
                 print(f"[download] chunk {info.index}: {node_id} lost the chunk, trying next copy")
+                problems.append((node_id, "missing"))
                 continue
+            except ChunkCorrupt as e:
+                # the node itself refused to serve it, or it was damaged on the wire
+                print(f"[download] chunk {info.index}: {e}, trying next copy")
+                problems.append((node_id, "corrupt"))
+                continue
+
+            if not verify(data, info.checksum):
+                print(f"[download] chunk {info.index}: copy on {node_id} is CORRUPT "
+                    f"(checksum mismatch), trying next copy")
+                problems.append((node_id, "corrupt"))
+                continue
+
             print(f"[download] chunk {info.index} <- {node_id}")
             return data
-        raise RuntimeError(
-            f"All {len(info.replicas)} copies of chunk {info.index} are unavailable"
-        )
+
+        details = ", ".join(f"{n}: {why}" for n, why in problems)
+        raise RuntimeError(f"No good copy of chunk {info.index} ({details})")
 
     # ------------------------------------------------------------------
     # health (read-only: detects problems, does not repair them)

@@ -7,15 +7,27 @@ holds all of that knowledge.
 Chunks live on disk (one file per chunk id), so they survive a restart, like
 persistent storage in a container would. node_server.py wraps this class in
 HTTP endpoints.
+
+Integrity: next to every chunk the node keeps a small file with the chunk's
+checksum (in the hidden '.checksums' folder). When a chunk is read, the node
+recomputes the checksum and refuses to hand out a chunk that no longer matches
+(ChunkCorrupt), for example one that was damaged on disk.
 """
 
 import os
 import re
 import threading
 
+from checksum import compute, verify
+
 
 class NodeUnavailable(Exception):
     """Raised when a node cannot be reached (used by remote_node.py)."""
+
+
+class ChunkCorrupt(Exception):
+    """Raised when chunk data does not match its checksum: damaged in transit,
+    or damaged while stored on a node."""
 
 
 # A chunk id becomes a file name, so only allow plain names: letters, digits,
@@ -28,6 +40,10 @@ _SAFE_CHUNK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # Temp files start with '.', which no valid chunk id can, so they never clash.
 _TEMP_PREFIX = ".tmp-"
 
+# Folder (inside data_dir) holding one checksum file per chunk, same name as
+# the chunk. Kept in a sub-folder so it can never clash with a chunk id.
+_CHECKSUM_DIR = ".checksums"
+
 
 class ChunkStore:
     """Keeps chunks as files in a folder, so they survive a restart."""
@@ -35,19 +51,22 @@ class ChunkStore:
     def __init__(self, data_dir: str, capacity: int):
         self.data_dir = data_dir
         self.capacity = capacity
+        self._checksum_dir = os.path.join(data_dir, _CHECKSUM_DIR)
         # A web server handles requests on several threads. This lock makes
         # "check free space, then write" one step so two uploads can't both
         # squeeze into the last bit of space.
         self._lock = threading.Lock()
 
         os.makedirs(self.data_dir, exist_ok=True)
+        os.makedirs(self._checksum_dir, exist_ok=True)
         self._remove_leftover_temp_files()
 
     def _remove_leftover_temp_files(self) -> None:
         """Delete temp files left behind by a crash during a write."""
-        for entry in os.scandir(self.data_dir):
-            if entry.is_file() and entry.name.startswith(_TEMP_PREFIX):
-                os.remove(entry.path)
+        for folder in (self.data_dir, self._checksum_dir):
+            for entry in os.scandir(folder):
+                if entry.is_file() and entry.name.startswith(_TEMP_PREFIX):
+                    os.remove(entry.path)
 
     def _path_for(self, chunk_id: str) -> str:
         """File path for a chunk. Raises ValueError for an unsafe id."""
@@ -55,15 +74,33 @@ class ChunkStore:
             raise ValueError(f"Invalid chunk id: {chunk_id!r}")
         return os.path.join(self.data_dir, chunk_id)
 
+    def _checksum_path_for(self, chunk_id: str) -> str:
+        """Path of the file holding this chunk's stored checksum."""
+        self._path_for(chunk_id)   # validates the id
+        return os.path.join(self._checksum_dir, chunk_id)
+
     def _chunk_files(self):
         """Yield the directory entries that are real chunks (not temp files)."""
         for entry in os.scandir(self.data_dir):
             if entry.is_file() and not entry.name.startswith("."):
                 yield entry
 
+    def _write_atomically(self, path: str, content: bytes) -> None:
+        """Write via a temp file in the same folder, then rename into place."""
+        temp_path = os.path.join(os.path.dirname(path), _TEMP_PREFIX + os.path.basename(path))
+        try:
+            with open(temp_path, "wb") as f:
+                f.write(content)
+            os.replace(temp_path, path)   # atomic: all of it or none of it
+        except BaseException:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
+
     def used_space(self) -> int:
-        """Total bytes on disk in this store's folder (temp files included, so
-        space being written right now is counted)."""
+        """Total bytes of chunk data on disk (temp files included, so space
+        being written right now is counted). The tiny checksum files are not
+        counted."""
         return sum(e.stat().st_size for e in os.scandir(self.data_dir) if e.is_file())
 
     def free_space(self) -> int:
@@ -75,34 +112,59 @@ class ChunkStore:
         return sum(1 for _ in self._chunk_files())
 
     def store(self, chunk_id: str, data: bytes) -> bool:
-        """Write the chunk file. Returns False if it doesn't fit.
-        Storing an id that already exists replaces it; only the size
+        """Write the chunk file and its checksum. Returns False if it doesn't
+        fit. Storing an id that already exists replaces it; only the size
         difference needs room. Raises ValueError for an unsafe id."""
         path = self._path_for(chunk_id)
+        checksum_path = self._checksum_path_for(chunk_id)
 
         with self._lock:
             existing = os.path.getsize(path) if os.path.isfile(path) else 0
             if len(data) - existing > self.free_space():
                 return False
 
-            temp_path = os.path.join(self.data_dir, _TEMP_PREFIX + chunk_id)
-            try:
-                with open(temp_path, "wb") as f:
-                    f.write(data)
-                os.replace(temp_path, path)   # atomic: all of it or none of it
-            except BaseException:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-                raise
+            # Drop the old checksum first: if we crash between the two writes
+            # below, the chunk is merely unchecked, never wrongly "corrupt".
+            if os.path.exists(checksum_path):
+                os.remove(checksum_path)
+            self._write_atomically(path, data)
+            self._write_atomically(checksum_path, compute(data).encode("ascii"))
             return True
 
     def get(self, chunk_id: str) -> bytes:
-        """Read the chunk file. Raises KeyError if absent, ValueError for an
-        unsafe id."""
+        """Read the chunk file and check it against its stored checksum.
+        Raises KeyError if absent, ChunkCorrupt if it no longer matches its
+        checksum, ValueError for an unsafe id. (A chunk with no checksum file,
+        e.g. stored before checksums existed, is returned unchecked.)"""
         path = self._path_for(chunk_id)
         try:
             with open(path, "rb") as f:
-                return f.read()
+                data = f.read()
+        except FileNotFoundError:
+            raise KeyError(chunk_id) from None
+
+        stored = self.stored_checksum(chunk_id)
+        if stored is not None and not verify(data, stored):
+            raise ChunkCorrupt(f"Chunk '{chunk_id}' no longer matches its checksum")
+        return data
+
+    def stored_checksum(self, chunk_id: str):
+        """The checksum saved when the chunk was written, or None if there is
+        none. Raises ValueError for an unsafe id."""
+        try:
+            with open(self._checksum_path_for(chunk_id), "rb") as f:
+                return f.read().decode("ascii").strip()
+        except FileNotFoundError:
+            return None
+
+    def compute_checksum(self, chunk_id: str) -> str:
+        """Checksum of the chunk file as it is on disk right now (recomputed,
+        not the saved one). Lets a caller verify a chunk without downloading
+        it. Raises KeyError if absent, ValueError for an unsafe id."""
+        path = self._path_for(chunk_id)
+        try:
+            with open(path, "rb") as f:
+                return compute(f.read())
         except FileNotFoundError:
             raise KeyError(chunk_id) from None
 
@@ -111,11 +173,13 @@ class ChunkStore:
         return os.path.isfile(self._path_for(chunk_id))
 
     def delete(self, chunk_id: str) -> None:
-        """Remove the chunk file; no error if absent. Raises ValueError for an
-        unsafe id."""
+        """Remove the chunk file and its checksum; no error if absent. Raises
+        ValueError for an unsafe id."""
         path = self._path_for(chunk_id)
+        checksum_path = self._checksum_path_for(chunk_id)
         with self._lock:
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                pass
+            for p in (path, checksum_path):
+                try:
+                    os.remove(p)
+                except FileNotFoundError:
+                    pass

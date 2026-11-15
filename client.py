@@ -7,10 +7,11 @@ Download: GET from distributor -> deserialize -> save_document
 import os
 import requests
 
+from checksum import compute, verify
 from file_upload import read_document, save_document
 from serDe import serialize, deserialize
 
-BASE_URL = "http://localhost:5000/api/v1"
+BASE_URL = "http://127.0.0.1:5000/api/v1"   # not "localhost": slow on Windows (IPv6 first)
 
 
 class Client:
@@ -29,7 +30,8 @@ class Client:
         raise ValueError(f"Server said {response.status_code}: {message}")
 
     def upload(self, path: str) -> dict:
-        """Read the file, serialize it to binary, send it. The file's name
+        """Read the file, serialize it to binary, send it together with its
+        checksum so the server can detect damage in transit. The file's name
         is its identity. Returns the server's JSON (name, size, chunks)."""
         document = read_document(path)
         data = serialize(document)
@@ -38,14 +40,23 @@ class Client:
         response = requests.post(
             f"{self.base_url}/objects",
             files={"file": (name, data, "application/octet-stream")},
+            data={"checksum": compute(data)},   # fingerprint of exactly these bytes
         )
         self._check(response)
         return response.json()
 
     def retrieve(self, name: str, save_to: str) -> None:
-        """Fetch the object by name, deserialize it, write it to save_to."""
+        """Fetch the object by name, verify it against the checksum the server
+        sent, deserialize it, write it to save_to.
+        Raises ValueError if the data arrived damaged."""
         response = requests.get(f"{self.base_url}/objects/{name}")
         self._check(response)
+
+        expected = response.headers.get("X-Checksum")
+        if not expected:
+            raise ValueError("Server sent no checksum, cannot verify the download")
+        if not verify(response.content, expected):
+            raise ValueError("Checksum mismatch: the download was damaged in transit")
 
         document = deserialize(response.content)
         save_document(save_to, document)

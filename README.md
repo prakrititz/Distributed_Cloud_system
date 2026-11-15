@@ -5,8 +5,8 @@ A basic storage system where a client uploads and retrieves files of any type
 splits each file into 1 MB chunks and stores every chunk on two different nodes
 (replication factor 2) across four nodes.
 
-Covers upload, download, replication, and failure simulation. No Docker,
-repair, per-chunk integrity checks, or custom metadata yet.
+Covers upload, download, replication, failure simulation, and corruption
+detection (checksums). No Docker, repair, or custom metadata yet.
 
 ## Architecture
 
@@ -71,6 +71,28 @@ The content is never decoded, so any file type round-trips unchanged. The
 distributor stores and returns these bytes as they are. Only the client
 deserializes them, and it rejects truncated or corrupted data.
 
+## Integrity checks (checksums)
+
+Every check uses one function, `checksum.compute(data)` (SHA-256, 64 hex
+characters), and `checksum.verify(data, expected)`.
+
+| Where | What is checked | If it fails |
+|---|---|---|
+| Client -> server | The client sends the checksum of the upload (`checksum` form field); the server verifies it before storing anything. | 400, nothing stored |
+| Server -> client | The server sends the checksum of the download in the `X-Checksum` header; the client verifies it before decoding. | The client raises an error |
+| Distributor -> node | Each chunk is sent with an `X-Checksum` header; the node verifies it before writing. | 422, nothing stored, the upload rolls back |
+| On the node | The node saves a checksum next to each chunk (in `.checksums/`) and rechecks it on every read. | 409, the damaged chunk is not sent |
+| Distributor, on read | Every chunk read from a node is checked against the checksum the distributor recorded at upload, and the reassembled file against the whole-file checksum. | The copy is skipped and the other replica is used |
+
+The distributor's own record is the authority: a node cannot vouch for itself.
+If both copies of a chunk are damaged, the download fails with a clear 503
+(`No good copy of chunk 0 (Node1: corrupt, Node2: corrupt)`) instead of
+returning bad data. A node can also recompute a stored chunk's checksum without
+sending it (`GET /internal/chunks/<id>/checksum`), for scans.
+
+To try it, upload a file larger than 1 MB, change a byte in one of the chunk
+files under `data/<node>/`, and download: the file still comes back correct.
+
 ## Setup and run
 
 ```
@@ -97,7 +119,7 @@ curl -X POST http://localhost:5000/api/v1/nodes/Node1/start    # bring it back
 - Storage is in memory, so restarting the server loses all objects.
 - Whole files are held in memory during upload and download.
 - No repair: after a failure, chunks stay under-replicated until the node returns.
-- No per-chunk integrity checks, so a corrupted copy is not detected by the
-  distributor.
+- Corruption is detected and avoided but not repaired, and the health report
+  (`/api/v1/replication`) does not yet flag corrupt copies.
 - Content type and custom metadata are not stored yet.
 - Nodes are in-process objects; heartbeats and Docker are not implemented.

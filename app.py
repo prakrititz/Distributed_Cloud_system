@@ -10,6 +10,7 @@ import io
 
 from flask import Flask, request, jsonify, send_file
 
+from checksum import compute, verify
 from config import NODE_ADDRESSES
 from distributor import Distributor
 from node import NodeUnavailable
@@ -31,17 +32,28 @@ def error(message: str, status: int):
 
 @app.route("/api/v1/objects", methods=["POST"])
 def upload_object():
-    """Receive a file (multipart field 'file'), pass it to distributor.upload.
+    """Receive a file (multipart field 'file') and its checksum (form field
+    'checksum'), verify the file, then pass it to distributor.upload.
     Return JSON with name, object_id, size, number of chunks. Status 201.
-    400 if no file / empty name, 409 if the name exists, 503 if there is not
-    enough space on enough live nodes to store every chunk twice.
+    400 if no file / empty name / no checksum / checksum mismatch (the upload
+    was damaged in transit, nothing is stored), 409 if the name exists, 503 if
+    there is not enough space on enough live nodes to store every chunk twice.
     """
     file = request.files.get("file")
     if file is None or not file.filename:
         return error("Missing 'file' field in the multipart upload", 400)
 
+    expected = request.form.get("checksum")
+    if not expected:
+        return error("Missing 'checksum' field in the multipart upload", 400)
+
     name = file.filename
     data = file.read()
+
+    # Check A (client -> server): the bytes that arrived must match the
+    # checksum the client computed before sending. Reject before storing.
+    if not verify(data, expected):
+        return error("Checksum mismatch: the upload was damaged in transit", 400)
 
     try:
         object_id = distributor.upload(name, data)
@@ -62,7 +74,8 @@ def upload_object():
 
 @app.route("/api/v1/objects/<name>", methods=["GET"])
 def download_object(name):
-    """Ask distributor.download for the bytes and send them back.
+    """Ask distributor.download for the bytes and send them back, with their
+    checksum in the 'X-Checksum' header so the client can verify them.
     404 if no object has that name, 503 if every copy of a chunk is down.
     """
     if name not in distributor.names:
@@ -73,7 +86,9 @@ def download_object(name):
     except RuntimeError as e:
         return error(str(e), 503)
 
-    return send_file(io.BytesIO(data), mimetype="application/octet-stream")
+    response = send_file(io.BytesIO(data), mimetype="application/octet-stream")
+    response.headers["X-Checksum"] = compute(data)
+    return response
 
 
 @app.route("/api/v1/objects/<name>/chunks", methods=["GET"])
