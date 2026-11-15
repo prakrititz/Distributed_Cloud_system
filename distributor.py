@@ -76,6 +76,7 @@ class Distributor:
         # "check the path is free, then register the object" one step, and
         # protects changes to an object's metadata.
         self._lock = threading.Lock()
+        self._repair_lock = threading.Lock()   # only one repair at a time
 
     # ------------------------------------------------------------------
     # helpers
@@ -87,10 +88,12 @@ class Distributor:
             return [b""]
         return [data[i:i + self.chunk_size] for i in range(0, len(data), self.chunk_size)]
 
-    def _pick_nodes(self, chunk_size: int, count: int):
+    def _pick_nodes(self, chunk_size: int, count: int, exclude=()):
         """Choose `count` DIFFERENT live nodes that can fit this chunk, most
         free space first (ties keep node-list order). Returns the list, or
-        None if fewer than `count` nodes qualify.
+        None if fewer than `count` nodes qualify. Nodes whose id is in
+        `exclude` are never chosen (repair uses this to avoid nodes that
+        already hold a copy).
 
         Asks each node for its health ONCE and decides from that snapshot. An
         unreachable node is skipped. (Asking separately 'are you alive?' and
@@ -98,6 +101,8 @@ class Distributor:
         between.)"""
         candidates = []   # (free_space, node)
         for node in self.nodes:
+            if node.node_id in exclude:
+                continue
             try:
                 free = node.health()["free"]   # one HTTP request per node
             except NodeUnavailable:
@@ -353,23 +358,35 @@ class Distributor:
         return left_behind
 
     # ------------------------------------------------------------------
-    # health (read-only: detects problems, does not repair them)
+    # health (read-only report) and repair
     # ------------------------------------------------------------------
+    def _check_copy(self, node_id: str, info: ChunkInfo) -> str:
+        """Judge one copy of a chunk without downloading it: ask the node to
+        recompute the checksum of what is on its disk and compare it with the
+        checksum the distributor recorded at upload.
+
+        Returns 'ok', 'down' (node unreachable), 'missing' (node is up but
+        has no such chunk) or 'corrupt' (the bytes no longer match)."""
+        try:
+            actual = self._get_node(node_id).get_checksum(info.chunk_id)["checksum"]
+        except NodeUnavailable:
+            return "down"
+        except (KeyError, ValueError):
+            return "missing"
+        return "ok" if actual == info.checksum else "corrupt"
+
     def replication_report(self) -> dict:
-        """For every chunk of every object: which replicas are usable right
-        now (node up and chunk present), and whether the chunk still has the
-        required number of copies.
+        """For every chunk of every object: the state of each copy (ok, down,
+        missing or corrupt) and whether the chunk still has the required
+        number of good copies.
 
         status per chunk:
-          healthy          usable copies >= replication factor
-          under_replicated 1 .. factor-1 usable copies (still downloadable)
-          unavailable      0 usable copies (download will fail)
+          healthy          good copies >= replication factor
+          under_replicated 1 .. factor-1 good copies (still downloadable)
+          unavailable      0 good copies (download will fail)
         """
         chunks = []
         counts = {"healthy": 0, "under_replicated": 0, "unavailable": 0}
-
-        # Ask every node once whether it is up, instead of once per chunk copy.
-        up = {n.node_id: n.alive for n in self.nodes}
 
         # list(...): an upload finishing meanwhile must not change the dict
         # while we loop over it.
@@ -377,12 +394,12 @@ class Distributor:
             for info in sorted(meta.chunks, key=lambda c: c.index):
                 replicas = []
                 for node_id in info.replicas:
-                    node_up = up.get(node_id, False)
+                    state = self._check_copy(node_id, info)
                     replicas.append({
                         "node": node_id,
-                        "node_up": node_up,
-                        # only ask a live node whether it holds the chunk
-                        "usable": node_up and self._get_node(node_id).has_chunk(info.chunk_id),
+                        "node_up": state != "down",
+                        "state": state,
+                        "usable": state == "ok",   # a corrupt copy is not usable
                     })
                 usable = sum(1 for r in replicas if r["usable"])
 
@@ -409,3 +426,127 @@ class Distributor:
             "summary": {"total_chunks": len(chunks), **counts},
             "chunks": chunks,
         }
+
+    def repair(self) -> dict:
+        """Bring every chunk back to the full number of good copies.
+
+        For each chunk: judge every recorded copy (_check_copy). If there are
+        enough good copies, leave it alone. Otherwise read the chunk from a good
+        copy (verified against the recorded checksum), write it to new live
+        nodes that do not already hold a good copy, and update the metadata.
+        Copies that are missing or corrupt are dropped from the metadata; a
+        damaged copy on a node that is up is deleted (or overwritten if that
+        node is chosen again). A copy on a node that is down is dropped too and
+        reported as left behind, since it cannot be deleted now.
+ 
+        A chunk with no good copy cannot be rebuilt: it is reported as
+        unrecoverable. A chunk that gets some but not all of its missing copies
+        (not enough live nodes with room) is reported as partial. Raises
+        RuntimeError if a repair is already running."""
+        if not self._repair_lock.acquire(blocking=False):
+            raise RuntimeError("A repair is already running")
+        try:
+            result = {"chunks_checked": 0, "healthy": 0, "repaired": 0, "partial": 0,
+                      "unrecoverable": 0, "copies_created": 0, "left_behind": [], "details": []}
+            for meta in list(self.metadata.values()):
+                for info in sorted(meta.chunks, key=lambda c: c.index):
+                    result["chunks_checked"] += 1
+                    outcome = self._repair_chunk(meta, info, result)
+                    result[outcome] += 1
+            print(f"[repair] checked {result['chunks_checked']} chunk(s): "
+                  f"{result['repaired']} repaired, {result['partial']} partial, "
+                  f"{result['unrecoverable']} unrecoverable, {result['copies_created']} copy/copies created")
+            return result
+        finally:
+            self._repair_lock.release()
+
+    def _repair_chunk(self, meta: ObjectMetadata, info: ChunkInfo, result: dict) -> str:
+        """Repair one chunk. Returns 'healthy', 'repaired', 'partial' or
+        'unrecoverable'; details go into `result`."""
+        states = {node_id: self._check_copy(node_id, info) for node_id in list(info.replicas)}
+        good = [n for n, s in states.items() if s == "ok"]
+        if len(good) >= self.replication_factor:
+            return "healthy"
+
+        detail = {"object_id": meta.object_id, "name": meta.name, "index": info.index,
+                  "chunk_id": info.chunk_id, "before": states, "added": []}
+        result["details"].append(detail)
+
+        if not good:
+            detail["outcome"] = "unrecoverable"
+            print(f"[repair] chunk {info.chunk_id}: NO good copy left, cannot rebuild")
+            return "unrecoverable"
+
+        # Read the chunk from a good copy and check it again against the
+        # recorded checksum (it could have been damaged since the check).
+        data = None
+        for node_id in good:
+            try:
+                candidate = self._get_node(node_id).get_chunk(info.chunk_id)
+            except (NodeUnavailable, KeyError, ChunkCorrupt):
+                continue
+            if verify(candidate, info.checksum):
+                data = candidate
+                break
+        if data is None:
+            detail["outcome"] = "unrecoverable"
+            return "unrecoverable"
+
+        # Choose homes for the missing copies. Prefer nodes that hold no copy
+        # at all; if there are not enough, a node with a damaged copy may be
+        # reused (storing over it replaces it).
+        need = self.replication_factor - len(good)
+        bad = [n for n in states if n not in good]
+        targets = self._pick_nodes(len(data), need, exclude=set(info.replicas))
+        if targets is None:
+            targets = self._pick_nodes(len(data), need, exclude=set(good))
+        if targets is None:
+            # not enough room for all: place as many as we can, one at a time
+            targets = []
+            for _ in range(need):
+                picked = self._pick_nodes(len(data), 1, exclude=set(good) | {n.node_id for n in targets})
+                if picked is None:
+                    break
+                targets.append(picked[0])
+
+        added = []
+        for node in targets:
+            try:
+                if node.store_chunk(info.chunk_id, data):
+                    added.append(node.node_id)
+            except (NodeUnavailable, ChunkCorrupt):
+                pass
+
+        # Record the new layout, unless the object was deleted while we worked
+        # (then the new copies must not be left behind).
+        # A copy on a node that is only down is dropped only if it was actually
+        # replaced; otherwise it stays recorded, since the node may come back
+        # with a perfectly good copy.
+        down = [n for n in bad if states[n] == "down"]
+        still_short = max(0, self.replication_factor - len(good) - len(added))
+        kept_down = down[:still_short]
+        with self._lock:
+            still_there = self.metadata.get(meta.object_id) is meta
+            if still_there:
+                info.replicas = good + added + kept_down
+        if not still_there:
+            for node_id in added:
+                try:
+                    self._get_node(node_id).delete_chunk(info.chunk_id)
+                except NodeUnavailable:
+                    pass
+            return "healthy"
+
+        # Clean up the dropped copies.
+        for node_id in bad:
+            if node_id in added or node_id in kept_down:
+                continue   # overwritten with the good bytes / still recorded
+            if states[node_id] == "down":
+                result["left_behind"].append({"node": node_id, "chunk_id": info.chunk_id})
+            elif states[node_id] == "corrupt":
+                try:
+                    self._get_node(node_id).delete_chunk(info.chunk_id)
+                except NodeUnavailable:
+                    result["left_behind"].append({"node": node_id, "chunk_id": info.chunk_id})
+
+                                                      

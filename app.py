@@ -266,6 +266,17 @@ def show_replication():
     return jsonify(distributor.replication_report())
 
 
+@app.route("/api/v1/repair", methods=["POST"])
+def repair():
+    """Re-replicate: bring every chunk back to the full number of good copies
+    (after a node failure or a corrupt copy) and report what was done.
+    409 if a repair is already running."""
+    try:
+        return jsonify(distributor.repair())
+    except RuntimeError as e:
+        return error(str(e), 409)
+
+
 if __name__ == "__main__":
     # use_reloader=False: the reloader would start a second process with its
     # own empty copy of the nodes, which is confusing while we're learning.

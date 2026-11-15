@@ -6,8 +6,8 @@ splits each file into 1 MB chunks and stores every chunk on two different nodes
 (replication factor 2) across four nodes.
 
 Covers upload, download, delete, object metadata (including custom key-value
-metadata), replication, and corruption detection (checksums). No Docker or
-repair yet.
+metadata), replication, corruption detection (checksums) and repair
+(re-replication). No Docker yet.
 
 ## Architecture
 
@@ -44,9 +44,21 @@ the upload fails with 503, so a chunk is never kept with fewer than two copies.
 one that answers; if its node is down or lost the chunk, fall back to the other
 copy. It fails with 503 only if every copy of some chunk is unavailable.
 
-**Health:** `GET /api/v1/replication` reports each chunk as `healthy` (2 usable
-copies), `under_replicated` (1 usable copy, still downloadable) or `unavailable`
-(0 usable copies). It only reports; it does not repair.
+**Health:** `GET /api/v1/replication` reports each chunk as `healthy` (2 good
+copies), `under_replicated` (1 good copy, still downloadable) or `unavailable`
+(0 good copies). Each copy is `ok`, `down` (node unreachable), `missing` or
+`corrupt` (a node recomputes the checksum of what is on its disk and the
+distributor compares it with the checksum it recorded). It only reports.
+
+**Repair:** `POST /api/v1/repair` brings every chunk back to 2 good copies. For
+each chunk with fewer, it reads a verified good copy and writes it to live nodes
+that hold no copy, then updates the metadata. A damaged copy on a live node is
+deleted (or overwritten); a copy on a node that is down is dropped only once it
+has been replaced, and is listed as `left_behind` since it cannot be deleted
+now. A chunk with no good copy is reported `unrecoverable` and is never
+invented; one that cannot get all its copies (too few live nodes with room) is
+`partial`. Repair is triggered by this call, not automatic, and only one runs
+at a time (409 otherwise).
 
 Objects are identified by the `object_id` returned from an upload. The file name
 is only metadata, so several objects can share it. What makes an upload a
@@ -82,7 +94,8 @@ GET /api/v1/objects/<object_id>/metadata
 | PATCH | `/api/v1/objects/<object_id>/metadata` | Add/update custom metadata (JSON object; `null` removes a key) | 400 bad body, 404 unknown id |
 | DELETE | `/api/v1/objects/<object_id>` | Delete the object and all copies of its chunks, returns 204 | 404 unknown id |
 | GET | `/api/v1/nodes` | Debug: up/down, capacity, used, free and chunk count per node | |
-| GET | `/api/v1/replication` | Debug: health of every chunk | |
+| GET | `/api/v1/replication` | Debug: health of every chunk and the state of each copy | |
+| POST | `/api/v1/repair` | Re-replicate under-replicated and corrupt chunks; returns what was done | 409 a repair is already running |
 
 Errors are always JSON: `{"error": "..."}`, including unknown URLs (404), wrong
 methods (405) and unexpected failures (500). `checksum` is optional: when given,
@@ -160,9 +173,10 @@ python client.py                                                 # download stil
 - Metadata is kept in the API process's memory, so restarting it forgets every
   object (the chunk files stay on the nodes).
 - Whole files are held in memory during upload and download.
-- No repair: after a failure, chunks stay under-replicated until the node returns.
-- Corruption is detected and avoided but not repaired, and the health report
-  (`/api/v1/replication`) does not yet flag corrupt copies.
+- Repair runs only when `POST /api/v1/repair` is called; nothing triggers it
+  automatically yet.
+- Copies left on a node that was down during repair stay on its disk as orphans
+  (they are listed, not cleaned up).
 - Nodes are listed in `config.py`; there is no registration or heartbeat yet.
 - The client wraps each file in a small header (see "Serialized format"), so the
   bytes stored on the nodes are that wrapped form. `size` still reports the
