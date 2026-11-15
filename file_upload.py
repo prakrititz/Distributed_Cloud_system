@@ -17,7 +17,6 @@ def save_file(path: str, data: bytes) -> None:
     with open(path, "wb") as f:
         f.write(data)
 
-
 # The client still imports these names, so keep them as aliases.
 read_document = read_file
 save_document = save_file

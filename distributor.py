@@ -7,8 +7,14 @@ of every object lives. Nodes just store bytes and never talk to each other.
 
 Replication: every chunk is stored on REPLICATION_FACTOR different nodes.
 The distributor writes each copy itself.
+
+The nodes it is given are RemoteNode objects (remote_node.py): every call on
+them is an HTTP request to that node's server. The distributor only relies on
+these methods: health(), alive, store_chunk(), get_chunk(), has_chunk() and
+delete_chunk().
 """
 
+import threading
 import uuid
 from dataclasses import dataclass, field
 
@@ -38,11 +44,14 @@ class ObjectMetadata:
 class Distributor:
     def __init__(self, nodes: list, chunk_size: int = CHUNK_SIZE,
                  replication_factor: int = REPLICATION_FACTOR):
-        self.nodes = nodes             # list of Node (the node registry, for now)
+        self.nodes = nodes             # list of RemoteNode (the node registry, for now)
         self.chunk_size = chunk_size   # a parameter so we can test with tiny chunks
         self.replication_factor = replication_factor
         self.metadata = {}             # object_id -> ObjectMetadata
         self.names = {}                # name -> object_id (what the client looks up by)
+        # The web server handles requests on several threads. This lock makes
+        # "check the name is free, then register it" one step.
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # helpers
@@ -57,12 +66,25 @@ class Distributor:
     def _pick_nodes(self, chunk_size: int, count: int):
         """Choose `count` DIFFERENT live nodes that can fit this chunk, most
         free space first (ties keep node-list order). Returns the list, or
-        None if fewer than `count` nodes qualify."""
-        candidates = [n for n in self.nodes if n.alive and n.free_space() >= chunk_size]
+        None if fewer than `count` nodes qualify.
+
+        Asks each node for its health ONCE and decides from that snapshot. An
+        unreachable node is skipped. (Asking separately 'are you alive?' and
+        'how much space?' would cost more requests, and the node could die in
+        between.)"""
+        candidates = []   # (free_space, node)
+        for node in self.nodes:
+            try:
+                free = node.health()["free"]   # one HTTP request per node
+            except NodeUnavailable:
+                continue                       # unreachable: not a candidate
+            if free >= chunk_size:
+                candidates.append((free, node))
+
         if len(candidates) < count:
             return None
-        candidates.sort(key=lambda n: -n.free_space())  # stable sort
-        return candidates[:count]
+        candidates.sort(key=lambda c: -c[0])   # stable: ties keep node-list order
+        return [node for _, node in candidates[:count]]
 
     def _get_node(self, node_id: str):
         """Find a node by its id."""
@@ -120,44 +142,52 @@ class Distributor:
         #   it is simply thrown away.
         written = []
         placed = []
-        for index, chunk in enumerate(chunk_list):
-            chunk_id = f"{object_id}-{index}"
-            targets = self._pick_nodes(len(chunk), self.replication_factor)
+        try:
+            for index, chunk in enumerate(chunk_list):
+                chunk_id = f"{object_id}-{index}"
+                targets = self._pick_nodes(len(chunk), self.replication_factor)
 
-            if targets is None:
-                print(f"[upload] chunk {index}: fewer than {self.replication_factor} "
-                      f"live nodes have room for {len(chunk)} bytes, rolling back")
-                self._rollback(written)
-                raise RuntimeError(
-                    f"Not enough storage: need {self.replication_factor} different "
-                    f"live nodes with room for chunk {index}"
-                )
-
-            for node in targets:
-                try:
-                    stored = node.store_chunk(chunk_id, chunk)
-                except NodeUnavailable:
-                    stored = False
-                if not stored:
-                    print(f"[upload] chunk {index}: could not store a copy on "
-                          f"{node.node_id}, rolling back")
-                    self._rollback(written)
+                if targets is None:
                     raise RuntimeError(
-                        f"Could not store a copy of chunk {index} on {node.node_id}"
+                        f"Not enough storage: need {self.replication_factor} different "
+                        f"live nodes with room for chunk {index}"
                     )
-                written.append((chunk_id, node))   # remember this copy for rollback
 
-            replica_ids = [n.node_id for n in targets]
-            print(f"[upload] chunk {index} ({len(chunk)} bytes) -> {', '.join(replica_ids)}")
-            placed.append(ChunkInfo(chunk_id, index, replica_ids))   # all copies stored: record the chunk
+                for node in targets:
+                    try:
+                        stored = node.store_chunk(chunk_id, chunk)
+                    except NodeUnavailable:
+                        stored = False
+                    if not stored:
+                        raise RuntimeError(
+                            f"Could not store a copy of chunk {index} on {node.node_id}"
+                        )
+                    written.append((chunk_id, node))   # remember this copy for rollback
 
-        self.metadata[object_id] = ObjectMetadata(
-            object_id=object_id,
-            name=name,
-            size=len(data),
-            chunks=placed,
-        )
-        self.names[name] = object_id
+                replica_ids = [n.node_id for n in targets]
+                print(f"[upload] chunk {index} ({len(chunk)} bytes) -> {', '.join(replica_ids)}")
+                placed.append(ChunkInfo(chunk_id, index, replica_ids))   # all copies stored: record the chunk
+
+            # Register the object. Done under the lock, and the name is checked
+            # again: another upload with the same name may have finished while
+            # this one was storing chunks.
+            with self._lock:
+                if name in self.names:
+                    raise FileExistsError(f"An object named '{name}' already exists")
+                self.metadata[object_id] = ObjectMetadata(
+                    object_id=object_id,
+                    name=name,
+                    size=len(data),
+                    chunks=placed,
+                )
+                self.names[name] = object_id
+        except Exception as e:
+            # Whatever went wrong (no space, a node died, a bug), never leave
+            # copies behind that no metadata points to.
+            print(f"[upload] '{name}' failed ({e}); rolling back {len(written)} copy/copies")
+            self._rollback(written)
+            raise
+
         print(f"[upload] done, '{name}' -> object_id={object_id}")
         return object_id
 
@@ -212,16 +242,22 @@ class Distributor:
         chunks = []
         counts = {"healthy": 0, "under_replicated": 0, "unavailable": 0}
 
-        for name, object_id in self.names.items():
+        # Ask every node once whether it is up, instead of once per chunk copy.
+        up = {n.node_id: n.alive for n in self.nodes}
+
+        # list(...): an upload finishing meanwhile must not change the dict
+        # while we loop over it.
+        for name, object_id in list(self.names.items()):
             meta = self.metadata[object_id]
             for info in sorted(meta.chunks, key=lambda c: c.index):
                 replicas = []
                 for node_id in info.replicas:
-                    node = self._get_node(node_id)
+                    node_up = up.get(node_id, False)
                     replicas.append({
                         "node": node_id,
-                        "node_up": node.alive,
-                        "usable": node.has_chunk(info.chunk_id),
+                        "node_up": node_up,
+                        # only ask a live node whether it holds the chunk
+                        "usable": node_up and self._get_node(node_id).has_chunk(info.chunk_id),
                     })
                 usable = sum(1 for r in replicas if r["usable"])
 

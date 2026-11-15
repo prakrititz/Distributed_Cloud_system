@@ -1,0 +1,106 @@
+"""Node server: ONE storage node running as its own process.
+
+Start one per node, each with its own port and data folder, e.g.
+
+    NODE_ID=Node1 PORT=5001 DATA_DIR=./data/Node1 python node_server.py
+    NODE_ID=Node2 PORT=5002 DATA_DIR=./data/Node2 python node_server.py
+    ...
+
+(PowerShell: $env:NODE_ID="Node1"; $env:PORT="5001"; python node_server.py)
+
+Settings (environment variables): NODE_ID, PORT, CAPACITY (bytes), DATA_DIR,
+HOST (use 0.0.0.0 inside a container so other containers can reach it).
+
+Later each of these becomes one Docker container built from the same image.
+The distributor talks to it only through the endpoints below, never by
+importing it. Nodes never talk to each other.
+"""
+import os
+
+from flask import Flask, Response, request, jsonify
+
+from node import ChunkStore
+
+app = Flask(__name__)
+
+NODE_ID = os.environ.get("NODE_ID", "Node1")
+HOST = os.environ.get("HOST", "127.0.0.1")
+PORT = int(os.environ.get("PORT", "5001"))
+CAPACITY = int(os.environ.get("CAPACITY", 5 * 1024 * 1024))   # bytes
+DATA_DIR = os.environ.get("DATA_DIR", f"./data/{NODE_ID}")
+
+store = ChunkStore(DATA_DIR, CAPACITY)
+
+
+def error(message: str, status: int):
+    """Every error response is JSON with a meaningful message."""
+    return jsonify({"error": message}), status
+
+
+@app.route("/internal/chunks/<chunk_id>", methods=["PUT"])
+def put_chunk(chunk_id):
+    """Store a chunk. The request body is the raw bytes.
+    201 on success, 507 if there is no space, 400 for a bad chunk_id.
+    Storing an id that already exists replaces it.
+    """
+    data = request.get_data()
+    try:
+        stored = store.store(chunk_id, data)
+    except ValueError as e:
+        return error(str(e), 400)
+
+    if not stored:
+        return error(
+            f"{NODE_ID} has no space for {len(data)} bytes ({store.free_space()} free)",
+            507,
+        )
+    print(f"[{NODE_ID}] stored {chunk_id} ({len(data)} bytes)")
+    return jsonify({"chunk_id": chunk_id, "size": len(data)}), 201
+
+
+@app.route("/internal/chunks/<chunk_id>", methods=["GET", "HEAD"])
+def get_chunk(chunk_id):
+    """Return the chunk's raw bytes (application/octet-stream).
+    404 if this node doesn't have it, 400 for a bad chunk_id.
+    HEAD answers 200 or 404 without sending the data: the cheap way to ask
+    'do you have this chunk?'.
+    """
+    try:
+        if request.method == "HEAD":
+            return Response(status=200 if store.has(chunk_id) else 404)
+        data = store.get(chunk_id)
+    except ValueError as e:
+        return error(str(e), 400)
+    except KeyError:
+        return error(f"{NODE_ID} has no chunk '{chunk_id}'", 404)
+
+    return Response(data, mimetype="application/octet-stream")
+
+
+@app.route("/internal/chunks/<chunk_id>", methods=["DELETE"])
+def delete_chunk(chunk_id):
+    """Delete a chunk. 204 even if it was already absent (deleting twice is
+    harmless), 400 for a bad chunk_id."""
+    try:
+        store.delete(chunk_id)
+    except ValueError as e:
+        return error(str(e), 400)
+    print(f"[{NODE_ID}] deleted {chunk_id}")
+    return "", 204
+
+
+@app.route("/internal/health", methods=["GET"])
+def health():
+    """Tell the distributor this node is alive and how much space it has."""
+    return jsonify({
+        "node_id": NODE_ID,
+        "capacity": store.capacity,
+        "used": store.used_space(),
+        "free": store.free_space(),
+        "chunks": store.chunk_count(),
+    })
+
+
+if __name__ == "__main__":
+    print(f"[{NODE_ID}] listening on {HOST}:{PORT}, data in {DATA_DIR}, capacity {CAPACITY} bytes")
+    app.run(host=HOST, port=PORT)

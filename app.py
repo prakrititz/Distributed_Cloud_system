@@ -1,31 +1,32 @@
-"""Flask app: the client-facing API. It owns the distributor and the 4 nodes.
+"""Flask app: the client-facing API. It owns the distributor, which talks to
+the node servers (node_server.py) over HTTP through RemoteNode objects.
 
 The client identifies an object by its name only. Object IDs stay internal.
+
+Start the 4 node servers first (see node_server.py), then this app. Each
+node's capacity is set on its own server (CAPACITY), not here.
 """
 import io
 
 from flask import Flask, request, jsonify, send_file
 
-from node import Node
+from config import NODE_ADDRESSES
 from distributor import Distributor
+from node import NodeUnavailable
+from remote_node import RemoteNode
 
 app = Flask(__name__)
 
-# 4 nodes with small capacity so a big file visibly spills over several nodes.
-# Every chunk is stored twice, so 20 MB of raw capacity holds about 10 MB of files.
-NODE_CAPACITY = 5 * 1024 * 1024  # 5 MB each, 20 MB in total
-nodes = [Node(f"Node{i}", NODE_CAPACITY) for i in range(1, 5)]
+# One RemoteNode per address in config.py. The distributor calls their methods
+# (store_chunk, get_chunk, ...) and each call becomes an HTTP request to that
+# node's server.
+nodes = [RemoteNode(node_id, url) for node_id, url in NODE_ADDRESSES.items()]
 distributor = Distributor(nodes)
 
 
 def error(message: str, status: int):
     """Every error response is JSON with a meaningful message."""
     return jsonify({"error": message}), status
-
-
-def find_node(node_id: str):
-    """Return the node with this id, or None."""
-    return next((n for n in nodes if n.node_id == node_id), None)
 
 
 @app.route("/api/v1/objects", methods=["POST"])
@@ -98,40 +99,24 @@ def show_distribution(name):
 
 @app.route("/api/v1/nodes", methods=["GET"])
 def show_nodes():
-    """Debug endpoint: up/down state and free/used space of each node."""
-    return jsonify([
-        {
-            "node": n.node_id,
-            "alive": n.alive,
-            "capacity": n.capacity,
-            "used": n.used_space(),
-            "free": n.free_space(),
-            "chunks": len(n.chunks),
-        }
-        for n in nodes
-    ])
-
-
-@app.route("/api/v1/nodes/<node_id>/stop", methods=["POST"])
-def stop_node(node_id):
-    """Simulate a node failure (stands in for `docker stop`). Chunks are kept."""
-    node = find_node(node_id)
-    if node is None:
-        return error(f"No node named '{node_id}'", 404)
-    node.stop()
-    print(f"[node] {node_id} stopped")
-    return jsonify({"node": node_id, "alive": node.alive})
-
-
-@app.route("/api/v1/nodes/<node_id>/start", methods=["POST"])
-def start_node(node_id):
-    """Bring a stopped node back (stands in for `docker start`)."""
-    node = find_node(node_id)
-    if node is None:
-        return error(f"No node named '{node_id}'", 404)
-    node.start()
-    print(f"[node] {node_id} started")
-    return jsonify({"node": node_id, "alive": node.alive})
+    """Debug endpoint: up/down state and free/used space of each node.
+    Asks each node's server for its health; a node that cannot be reached
+    is listed as down. To test a failure, stop that node's server process."""
+    report = []
+    for n in nodes:
+        try:
+            h = n.health()   # one request per node
+            report.append({
+                "node": n.node_id,
+                "alive": True,
+                "capacity": h["capacity"],
+                "used": h["used"],
+                "free": h["free"],
+                "chunks": h["chunks"],
+            })
+        except NodeUnavailable:
+            report.append({"node": n.node_id, "alive": False})
+    return jsonify(report)
 
 
 @app.route("/api/v1/replication", methods=["GET"])
