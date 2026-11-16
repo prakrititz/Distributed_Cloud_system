@@ -5,7 +5,7 @@ to, what order chunks come in, or that other nodes exist. The distributor
 holds all of that knowledge.
 
 Chunks live on disk (one file per chunk id), so they survive a restart, like
-persistent storage in a container would. node_server.py wraps this class in
+persistent storage in a container would. nodes/node_server.py wraps this class in
 HTTP endpoints.
 
 Integrity: next to every chunk the node keeps a small file with the chunk's
@@ -18,17 +18,8 @@ import os
 import re
 import threading
 
-from checksum import compute, verify
-
-
-class NodeUnavailable(Exception):
-    """Raised when a node cannot be reached (used by remote_node.py)."""
-
-
-class ChunkCorrupt(Exception):
-    """Raised when chunk data does not match its checksum: damaged in transit,
-    or damaged while stored on a node."""
-
+from helpers.checksum import compute, verify
+from helpers.errors import ChunkCorrupt   # raised by get() for a damaged chunk
 
 # A chunk id becomes a file name, so only allow plain names: letters, digits,
 # '.', '_' and '-', not starting with '.'. Anything else (slashes, '..', a

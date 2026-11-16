@@ -12,9 +12,9 @@ import mimetypes
 import os
 import requests
 
-from checksum import compute, verify
-from file_upload import read_document, save_document
-from serDe import serialize, deserialize
+from helpers.checksum import compute, verify
+from helpers.file_upload import read_document, save_document
+from helpers.serDe import serialize, deserialize
 
 BASE_URL = "http://127.0.0.1:5000/api/v1"   # not "localhost": slow on Windows (IPv6 first)
 

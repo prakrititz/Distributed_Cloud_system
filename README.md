@@ -1,4 +1,4 @@
-# Mini Distributed Object Store (Stage 1)
+# Mini Distributed Object Store
 
 A basic storage system where a client uploads and retrieves files of any type
 (documents, images, video, audio, archives, other binary data). A distributor
@@ -19,18 +19,38 @@ The distributor is the only component that knows where everything lives. Each
 node is its own server process with its own storage; nodes never talk to each
 other, and the distributor writes every copy itself through a `RemoteNode`.
 
+The code is split into three folders plus the entry points at the top level:
+
+```
+app.py  client.py  config.py       entry points and shared settings
+controller/                        everything that runs in the controller
+  distributor.py
+  remote_node.py
+nodes/                             everything that runs in a storage node
+  node.py
+  node_server.py
+helpers/                           small pieces both sides (and the client) use
+  checksum.py
+  serDe.py
+  file_upload.py
+  errors.py
+```
+
 | File | Role |
 |---|---|
-| `client.py` | Menu (upload / download / list / metadata / delete), talks to the Flask API over HTTP |
-| `file_upload.py` | Reads and saves files on disk as raw bytes |
-| `serDe.py` | Adds/strips a header with length and SHA-256 checksum |
-| `checksum.py` | `compute` / `verify`: the one checksum function (SHA-256) used everywhere |
 | `app.py` | Flask endpoints (client-facing API); owns the distributor |
-| `distributor.py` | Splits into chunks, places replicas, tracks metadata, reassembles, reports health |
-| `remote_node.py` | `RemoteNode`: the distributor's HTTP client for one node server |
-| `node_server.py` | One storage node as its own Flask process |
-| `node.py` | `ChunkStore`: the node's file-backed chunk storage, with checksums |
-| `config.py` | Node addresses and request timeouts |
+| `client.py` | Menu (upload / download / list / metadata / delete), talks to the Flask API over HTTP |
+| `config.py` | Node addresses, request timeouts and heartbeat settings |
+| `controller/distributor.py` | Splits into chunks, places replicas, tracks metadata, reassembles, reports health, repairs |
+| `controller/remote_node.py` | `RemoteNode`: the distributor's HTTP client for one node server |
+| `nodes/node_server.py` | One storage node as its own Flask process; sends the heartbeats |
+| `nodes/node.py` | `ChunkStore`: the node's file-backed chunk storage, with checksums |
+| `helpers/checksum.py` | `compute` / `verify`: the one checksum function (SHA-256) used everywhere |
+| `helpers/serDe.py` | Adds/strips a header with length and SHA-256 checksum |
+| `helpers/file_upload.py` | Reads and saves files on disk as raw bytes |
+| `helpers/errors.py` | `NodeUnavailable` and `ChunkCorrupt`, shared so the controller and the nodes never import each other |
+
+Run everything from the top folder (the one with `app.py`).
 
 ## How the distributor works
 
@@ -158,7 +178,7 @@ API, then the client:
 ```
 pip install flask requests
 
-$env:NODE_ID="Node1"; $env:PORT="5001"; python node_server.py    # Node2/5002, Node3/5003, Node4/5004
+$env:NODE_ID="Node1"; $env:PORT="5001"; python -m nodes.node_server    # Node2/5002, Node3/5003, Node4/5004
 
 python app.py       # the API on port 5000
 python client.py    # menu: upload, download, list, show/update metadata, delete

@@ -1,10 +1,10 @@
 """Flask app: the client-facing API. It owns the distributor, which talks to
-the node servers (node_server.py) over HTTP through RemoteNode objects.
+the node servers (nodes/node_server.py) over HTTP through RemoteNode objects.
 
 Objects are identified by the object_id returned from an upload. The file name
 is only metadata: several objects can share it.
 
-Start the 4 node servers first (see node_server.py), then this app. Each
+Start the 4 node servers first (see nodes/node_server.py), then this app. Each
 node's capacity is set on its own server (CAPACITY), not here.
 """
 import io
@@ -15,11 +15,11 @@ import os
 from flask import Flask, request, jsonify, send_file
 from werkzeug.exceptions import HTTPException
 
-from checksum import compute, verify
 from config import NODE_ADDRESSES
-from distributor import DEFAULT_CONTENT_TYPE, Distributor
-from node import NodeUnavailable
-from remote_node import RemoteNode
+from controller.distributor import DEFAULT_CONTENT_TYPE, Distributor
+from controller.remote_node import RemoteNode
+from helpers.checksum import compute, verify
+from helpers.errors import NodeUnavailable
 
 app = Flask(__name__)
 

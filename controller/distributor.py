@@ -12,7 +12,7 @@ Objects are identified by an object_id the distributor generates. The file
 name is only metadata and is not unique; what makes an upload a duplicate is
 its source_path (where the client read the file from).
 
-The nodes it is given are RemoteNode objects (remote_node.py): every call on
+The nodes it is given are RemoteNode objects (controller/remote_node.py): every call on
 them is an HTTP request to that node's server. The distributor only relies on
 these methods: health(), alive, store_chunk(), get_chunk(), has_chunk() and
 delete_chunk().
@@ -24,9 +24,9 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from checksum import compute, verify
 from config import HEARTBEAT_TIMEOUT
-from node import ChunkCorrupt, NodeUnavailable
+from helpers.checksum import compute, verify
+from helpers.errors import ChunkCorrupt, NodeUnavailable
 
 CHUNK_SIZE = 1024 * 1024    # 1 MB, as the project spec says
 REPLICATION_FACTOR = 2      # copies of every chunk, each on a different node

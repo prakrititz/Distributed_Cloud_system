@@ -2,11 +2,14 @@
 
 Start one per node, each with its own port and data folder, e.g.
 
-    NODE_ID=Node1 PORT=5001 DATA_DIR=./data/Node1 python node_server.py
-    NODE_ID=Node2 PORT=5002 DATA_DIR=./data/Node2 python node_server.py
+    NODE_ID=Node1 PORT=5001 DATA_DIR=./data/Node1 python -m nodes.node_server
+    NODE_ID=Node2 PORT=5002 DATA_DIR=./data/Node2 python -m nodes.node_server
     ...
 
-(PowerShell: $env:NODE_ID="Node1"; $env:PORT="5001"; python node_server.py)
+(PowerShell: $env:NODE_ID="Node1"; $env:PORT="5001"; python -m nodes.node_server)
+
+Run these from the project's top folder (the one with app.py), so that the
+helpers/ and nodes/ packages can be found.
 
 Settings (environment variables): NODE_ID, PORT, CAPACITY (bytes), DATA_DIR,
 HOST (use 0.0.0.0 inside a container so other containers can reach it),
@@ -24,10 +27,11 @@ import time
 import requests
 from flask import Flask, Response, request, jsonify
 
-from checksum import compute, verify
 from config import HEARTBEAT_INTERVAL as DEFAULT_HEARTBEAT_INTERVAL
 from config import CONTROLLER_URL as DEFAULT_CONTROLLER_URL
-from node import ChunkCorrupt, ChunkStore
+from helpers.checksum import compute, verify
+from helpers.errors import ChunkCorrupt
+from nodes.node import ChunkStore
 
 app = Flask(__name__)
 

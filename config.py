@@ -4,7 +4,7 @@ This dict is the node registry for now. Later, nodes could register
 themselves (POST /internal/workers/register) instead.
 """
 
-# node_id -> base URL of that node's server (see node_server.py)
+# node_id -> base URL of that node's server (see nodes/node_server.py)
 # TODO: adjust if you change ports, or read this from environment variables
 # Use 127.0.0.1, not "localhost": on Windows "localhost" tries IPv6 first and
 # waits about 2 seconds before falling back, which slowed every request.
