@@ -1,11 +1,11 @@
 """RemoteNode: how the distributor talks to a node over HTTP.
 
-This is the CLIENT side of the wire; node_server.py is the SERVER side. The
+This is the CLIENT side of the wire; nodes/node_server.py is the SERVER side. The
 distributor creates one RemoteNode per node and calls its methods. Each
 method sends one HTTP request to that node's server.
 
 It offers the same methods and attributes the distributor already uses, so
-distributor.py needs little or no change.
+controller/distributor.py needs little or no change.
 
 Error mapping the distributor understands:
     node unreachable / timeout / server error  -> raise NodeUnavailable
@@ -25,9 +25,9 @@ checksum it recorded at upload, which also covers damage on the way back.
 """
 import requests
 
-from checksum import compute
 from config import REQUEST_TIMEOUT
-from node import ChunkCorrupt, NodeUnavailable
+from helpers.checksum import compute
+from helpers.errors import ChunkCorrupt, NodeUnavailable
 
 
 class RemoteNode:
