@@ -4,6 +4,8 @@ This dict is the node registry for now. Later, nodes could register
 themselves (POST /internal/workers/register) instead.
 """
 
+import os
+
 # node_id -> base URL of that node's server (see nodes/node_server.py)
 # TODO: adjust if you change ports, or read this from environment variables
 # Use 127.0.0.1, not "localhost": on Windows "localhost" tries IPv6 first and
@@ -14,6 +16,32 @@ NODE_ADDRESSES = {
     "Node3": "http://127.0.0.1:5003",
     "Node4": "http://127.0.0.1:5004",
 }
+
+
+def parse_workers(text: str) -> dict:
+    """'worker1=http://worker1:5000,worker2=http://worker2:5000' -> {id: url}.
+    Raises ValueError for anything that is not id=url pairs."""
+    result = {}
+    for piece in text.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        node_id, sep, url = piece.partition("=")
+        node_id, url = node_id.strip(), url.strip()
+        if not sep or not node_id or not url.startswith(("http://", "https://")):
+            raise ValueError(f"WORKERS: '{piece}' is not id=http://address")
+        result[node_id] = url
+    if not result:
+        raise ValueError("WORKERS is set but lists no workers")
+    return result
+
+
+# In Docker the workers are other containers, reached by their service name, so
+# the list comes from the environment instead of the dict above:
+#     WORKERS=worker1=http://worker1:5000,worker2=http://worker2:5000,...
+# Each id must be the NODE_ID that worker uses when it sends its heartbeats.
+if os.environ.get("WORKERS"):
+    NODE_ADDRESSES = parse_workers(os.environ["WORKERS"])
 
 # Heartbeats: every node tells the controller "I'm alive, this much space is
 # free" every HEARTBEAT_INTERVAL seconds. The controller keeps the latest

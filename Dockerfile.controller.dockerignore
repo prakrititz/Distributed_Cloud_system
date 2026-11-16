@@ -1,0 +1,16 @@
+# What goes into the CONTROLLER image. Everything is excluded first, then the
+# few things it needs are let back in ("allowlist"), so a new file never ends
+# up in the image by accident.
+*
+
+# the controller runs app.py, which uses controller/, helpers/ and config.py
+!app.py
+!config.py
+!controller/
+!helpers/
+
+!requirements.txt
+
+# never copy cached bytecode, even from inside the allowed folders
+**/__pycache__
+**/*.pyc

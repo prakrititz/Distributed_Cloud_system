@@ -1,0 +1,57 @@
+# The WORKER image: nodes/ + helpers/ + config.py.
+# The SAME image is started four times (worker1..worker4), each with its own
+# NODE_ID and its own volume.
+#
+# Build from the project's top folder:
+#     docker build -f Dockerfile.worker -t object-store-worker .
+#
+# Which files go in is decided by Dockerfile.worker.dockerignore.
+
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Dependencies first (layer caching). requests is used to send the heartbeats.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# The code. Started with `python -m nodes.node_server` from /app, because it
+# imports "helpers" and "nodes" as packages.
+COPY . .
+
+# Settings. node_server.py reads all of these from the environment:
+#   NODE_ID             MUST be set differently for each container (worker1 ..
+#                       worker4). It is also the id the controller lists in WORKERS.
+#   HOST                0.0.0.0, otherwise other containers cannot reach it
+#   PORT                the port it listens on
+#   CAPACITY            bytes it may store (default: 5 MB)
+#   DATA_DIR            where the chunks live; this is the volume below
+#   CONTROLLER_URL      where heartbeats are sent
+#   HEARTBEAT_INTERVAL  seconds between heartbeats
+ENV HOST=0.0.0.0 \
+    PORT=5000 \
+    DATA_DIR=/data \
+    CONTROLLER_URL=http://controller:5000
+
+# Non-root user, and a /data folder it owns BEFORE it is declared a volume, so a
+# new volume starts out owned by that user (and the worker can write to it).
+RUN useradd --create-home --uid 10001 app \
+    && mkdir /data \
+    && chown app:app /data
+USER app
+
+# PERSISTENT STORAGE (required by the spec): the chunks live in /data, so they
+# survive `docker stop` / `docker start` and rebuilding the image. In
+# docker-compose give each worker its OWN named volume mounted at /data.
+VOLUME ["/data"]
+
+EXPOSE 5000
+
+# Healthy when the node answers its own health endpoint.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/internal/health' % os.environ.get('PORT', '5000'), timeout=2)"
+
+CMD ["python", "-m", "nodes.node_server"]

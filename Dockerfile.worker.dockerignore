@@ -1,0 +1,18 @@
+# What goes into the WORKER image. Everything is excluded first, then the few
+# things it needs are let back in ("allowlist").
+*
+
+# the worker runs nodes/node_server.py, which uses nodes/, helpers/ and the
+# defaults in config.py
+!config.py
+!nodes/
+!helpers/
+
+!requirements.txt
+
+# never copy cached bytecode, even from inside the allowed folders
+**/__pycache__
+**/*.pyc
+
+# note: data/ (the chunks of a local run) is NOT in the allowlist, so it can
+# never leak into an image; in Docker the chunks live in a volume instead.

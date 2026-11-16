@@ -301,4 +301,9 @@ def repair():
 if __name__ == "__main__":
     # use_reloader=False: the reloader would start a second process with its
     # own empty copy of the nodes, which is confusing while we're learning.
-    app.run(port=5000, debug=True, use_reloader=False)
+    # HOST=0.0.0.0 is needed inside a container, otherwise nothing outside it
+    # can connect. Debug mode (the interactive debugger) is off unless DEBUG=1.
+    app.run(host=os.environ.get("HOST", "127.0.0.1"),
+            port=int(os.environ.get("PORT", "5000")),
+            debug=os.environ.get("DEBUG") == "1",
+            use_reloader=False)
