@@ -23,6 +23,8 @@ from helpers.errors import NodeUnavailable
 
 app = Flask(__name__)
 
+MAX_CLIENT_ID_LENGTH = 128
+
 # One RemoteNode per address in config.py. The distributor calls their methods
 # (store_chunk, get_chunk, ...) and each call becomes an HTTP request to that
 # node's server.
@@ -73,6 +75,7 @@ def object_json(meta) -> dict:
         "modified_at": meta.modified_at,
         "checksum": meta.checksum,
         "source_path": meta.source_path,
+        "client_id": meta.client_id,
         "chunk_count": len(meta.chunks),
         "copies_per_chunk": distributor.replication_factor,
         "chunks": [
@@ -91,7 +94,12 @@ def upload_object():
       'metadata'  JSON object of custom key-value metadata
       'checksum'  checksum of the file; verified before anything is stored
       'path'      where the client read the file from. Two uploads from the
-                  same path are the same file, so the second is refused
+                  same path by the same client are the same file, so the
+                  second is refused
+      'client_id' which client is uploading (at most 128 characters). It
+                  scopes the 'path' rule: two clients may each upload their
+                  own '/files/a.txt'. Without it, uploads share one anonymous
+                  scope
       'size'      size of the original object, if the uploaded bytes are a
                   wrapped form of it (defaults to the uploaded size)
 
@@ -135,6 +143,10 @@ def upload_object():
                 raise ValueError("'size' must be an integer")
             if size < 0:
                 raise ValueError("'size' must not be negative")
+
+        client_id = (request.form.get("client_id") or "").strip()
+        if len(client_id) > MAX_CLIENT_ID_LENGTH:
+            raise ValueError(f"'client_id' must be at most {MAX_CLIENT_ID_LENGTH} characters")
     except ValueError as e:
         return error(str(e), 400)
 
@@ -142,6 +154,7 @@ def upload_object():
         object_id = distributor.upload(
             name, data, content_type=content_type, custom=custom,
             source_path=request.form.get("path") or None, size=size,
+            client_id=client_id or None,
         )
     except FileExistsError as e:
         return error(str(e), 409)

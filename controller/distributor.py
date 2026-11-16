@@ -10,7 +10,9 @@ The distributor writes each copy itself.
 
 Objects are identified by an object_id the distributor generates. The file
 name is only metadata and is not unique; what makes an upload a duplicate is
-its source_path (where the client read the file from).
+its source_path (where the client read the file from) together with the
+client_id of the client that sent it: the same path from the same client is the
+same file, while two different clients may use the same path string.
 
 The nodes it is given are RemoteNode objects (controller/remote_node.py): every call on
 them is an HTTP request to that node's server. The distributor only relies on
@@ -63,7 +65,8 @@ class ObjectMetadata:
     created_at: str = ""
     modified_at: str = ""                       # changes when custom metadata is patched
     custom: dict = field(default_factory=dict)  # user-defined key-value metadata
-    source_path: str = ""                       # where the client read the file; unique
+    source_path: str = ""                       # where the client read the file
+    client_id: str = ""                         # which client sent it; (client_id, source_path) is unique
 
 
 class Distributor:
@@ -80,7 +83,7 @@ class Distributor:
         self.chunk_size = chunk_size   # a parameter so we can test with tiny chunks
         self.replication_factor = replication_factor
         self.metadata = {}             # object_id -> ObjectMetadata
-        self.paths = {}                # source_path -> object_id (duplicate check)
+        self.paths = {}                # (client_id, source_path) -> object_id (duplicate check)
         # The web server handles requests on several threads. This lock makes
         # "check the path is free, then register the object" one step, and
         # protects changes to an object's metadata.
@@ -192,15 +195,17 @@ class Distributor:
                       f"copy of {chunk_id} left behind")
 
     @staticmethod
-    def _duplicate_message(source_path: str, existing_id: str) -> str:
-        return (f"An object uploaded from '{source_path}' already exists "
+    def _duplicate_message(client_id: str, source_path: str, existing_id: str) -> str:
+        who = f"client '{client_id}'" if client_id else "this client"
+        return (f"An object uploaded by {who} from '{source_path}' already exists "
                 f"(object_id {existing_id}); delete it first to upload it again")
 
     # ------------------------------------------------------------------
     # upload / download
     # ------------------------------------------------------------------
     def upload(self, name: str, data: bytes, content_type: str = DEFAULT_CONTENT_TYPE,
-               custom: dict = None, source_path: str = None, size: int = None) -> str:
+               custom: dict = None, source_path: str = None, size: int = None,
+               client_id: str = None) -> str:
         """Split data, store every chunk on REPLICATION_FACTOR different
         nodes, record metadata. Return the new object_id.
 
@@ -208,8 +213,12 @@ class Distributor:
         content_type e.g. 'video/mp4'
         custom       user-defined key-value metadata
         source_path  where the client read the file from. Two uploads with the
-                     same source_path are the same file, so the second is
-                     refused. Optional: without it, nothing is checked.
+                     same source_path from the same client are the same file,
+                     so the second is refused. Optional: without it, nothing
+                     is checked.
+        client_id    which client is uploading. It scopes the duplicate check,
+                     so two clients can each upload their own '/files/a.txt'.
+                     Optional: uploads without it share one anonymous scope.
         size         size of the original object if it differs from len(data)
                      (e.g. the client wraps the file in a header); defaults to
                      len(data)
@@ -221,10 +230,14 @@ class Distributor:
         half-uploaded is left behind. (Strict: no chunk is ever stored with
         fewer copies than the replication factor.)
 
-        Raises FileExistsError if an object from this source_path exists.
+        Raises FileExistsError if this client already has an object from this
+        source_path.
         """
-        if source_path and source_path in self.paths:
-            raise FileExistsError(self._duplicate_message(source_path, self.paths[source_path]))
+        client_id = client_id or ""
+        path_key = (client_id, source_path)
+        if source_path and path_key in self.paths:
+            raise FileExistsError(
+                self._duplicate_message(client_id, source_path, self.paths[path_key]))
 
         object_id = str(uuid.uuid4())
         chunk_list = self._split(data)
@@ -291,9 +304,9 @@ class Distributor:
             # again: another upload of the same file may have finished while
             # this one was storing chunks.
             with self._lock:
-                if source_path and source_path in self.paths:
+                if source_path and path_key in self.paths:
                     raise FileExistsError(
-                        self._duplicate_message(source_path, self.paths[source_path]))
+                        self._duplicate_message(client_id, source_path, self.paths[path_key]))
                 now = _now()
                 self.metadata[object_id] = ObjectMetadata(
                     object_id=object_id,
@@ -306,9 +319,10 @@ class Distributor:
                     modified_at=now,
                     custom=dict(custom or {}),
                     source_path=source_path or "",
+                    client_id=client_id,
                 )
                 if source_path:
-                    self.paths[source_path] = object_id
+                    self.paths[path_key] = object_id
         except Exception as e:
             # Whatever went wrong (no space, a node died, a bug), never leave
             # copies behind that no metadata points to.
@@ -418,8 +432,9 @@ class Distributor:
         with self._lock:
             meta = self.get_object(object_id)
             del self.metadata[object_id]
-            if meta.source_path and self.paths.get(meta.source_path) == object_id:
-                del self.paths[meta.source_path]
+            path_key = (meta.client_id, meta.source_path)
+            if meta.source_path and self.paths.get(path_key) == object_id:
+                del self.paths[path_key]
 
         left_behind = []
         for info in meta.chunks:

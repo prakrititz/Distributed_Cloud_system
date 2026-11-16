@@ -10,18 +10,29 @@ list option shows the ids of everything stored.
 import json
 import mimetypes
 import os
+import socket
 import requests
 
 from helpers.checksum import compute, verify
 from helpers.file_upload import read_document, save_document
 from helpers.serDe import serialize, deserialize
 
-BASE_URL = "http://127.0.0.1:5000/api/v1"   # not "localhost": slow on Windows (IPv6 first)
+# Where the API is. Override with API_URL (in Docker: http://controller:5000/api/v1).
+# Default uses 127.0.0.1, not "localhost": slow on Windows (IPv6 first).
+BASE_URL = os.environ.get("API_URL", "http://127.0.0.1:5000/api/v1")
+
+
+def default_client_id() -> str:
+    """Who this client is: CLIENT_ID from the environment, else the machine's
+    name. It should stay the same between runs (in Docker, set CLIENT_ID: a
+    container's own hostname changes every time it is created)."""
+    return os.environ.get("CLIENT_ID") or socket.gethostname()
 
 
 class Client:
-    def __init__(self, base_url: str = BASE_URL):
+    def __init__(self, base_url: str = BASE_URL, client_id: str = None):
         self.base_url = base_url
+        self.client_id = client_id or default_client_id()
 
     @staticmethod
     def _check(response) -> None:
@@ -37,8 +48,9 @@ class Client:
     def upload(self, path: str, metadata: dict = None) -> dict:
         """Read the file, serialize it to binary, send it together with its
         checksum (so the server can detect damage in transit), its content type,
-        its full path (two uploads from the same path are refused as the same
-        file) and optional custom metadata. Returns the new object's metadata
+        its full path and this client's id (two uploads from the same path by
+        the same client are refused as the same file) and optional custom
+        metadata. Returns the new object's metadata
         (object_id, size, content_type, times, chunks...)."""
         document = read_document(path)
         data = serialize(document)
@@ -48,6 +60,7 @@ class Client:
         form = {
             "checksum": compute(data),               # fingerprint of exactly these bytes
             "path": os.path.abspath(path),
+            "client_id": self.client_id,             # the duplicate rule is per client + path
             "size": str(len(document)),              # the original size, not the wrapped one
         }
         if metadata:

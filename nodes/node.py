@@ -17,6 +17,7 @@ recomputes the checksum and refuses to hand out a chunk that no longer matches
 import os
 import re
 import threading
+import time
 
 from helpers.checksum import compute, verify
 from helpers.errors import ChunkCorrupt   # raised by get() for a damaged chunk
@@ -34,6 +35,40 @@ _TEMP_PREFIX = ".tmp-"
 # Folder (inside data_dir) holding one checksum file per chunk, same name as
 # the chunk. Kept in a sub-folder so it can never clash with a chunk id.
 _CHECKSUM_DIR = ".checksums"
+
+
+def _retry_if_busy(action, attempts: int = 25, delay: float = 0.02):
+    """Run `action()`, trying again for a moment if the operating system refuses
+    because the file is in use.
+
+    On Windows a file cannot be deleted or replaced while another thread has it
+    open, for example a download that is reading the very chunk being deleted.
+    That lasts only as long as the read, so waiting a few milliseconds and
+    trying again is enough. (Without this, the delete failed with a 500 and the
+    chunk stayed on the node with no object pointing to it.) If the file is
+    still busy after about half a second, the error is raised as before."""
+    for attempt in range(attempts):
+        try:
+            return action()
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
+def _read_file(path: str) -> bytes:
+    """Read a whole file, waiting briefly if Windows refuses to open it because
+    it is being deleted or replaced at that moment. Raises FileNotFoundError if
+    the file is (or, after the wait, turns out to be) gone."""
+    def read():
+        with open(path, "rb") as f:
+            return f.read()
+    try:
+        return _retry_if_busy(read)
+    except PermissionError:
+        if not os.path.exists(path):
+            raise FileNotFoundError(path) from None
+        raise
 
 
 class ChunkStore:
@@ -82,7 +117,7 @@ class ChunkStore:
         try:
             with open(temp_path, "wb") as f:
                 f.write(content)
-            os.replace(temp_path, path)   # atomic: all of it or none of it
+            _retry_if_busy(lambda: os.replace(temp_path, path))   # atomic: all of it or none of it
         except BaseException:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -117,7 +152,7 @@ class ChunkStore:
             # Drop the old checksum first: if we crash between the two writes
             # below, the chunk is merely unchecked, never wrongly "corrupt".
             if os.path.exists(checksum_path):
-                os.remove(checksum_path)
+                _retry_if_busy(lambda: os.remove(checksum_path))
             self._write_atomically(path, data)
             self._write_atomically(checksum_path, compute(data).encode("ascii"))
             return True
@@ -129,8 +164,7 @@ class ChunkStore:
         e.g. stored before checksums existed, is returned unchecked.)"""
         path = self._path_for(chunk_id)
         try:
-            with open(path, "rb") as f:
-                data = f.read()
+            data = _read_file(path)
         except FileNotFoundError:
             raise KeyError(chunk_id) from None
 
@@ -143,8 +177,7 @@ class ChunkStore:
         """The checksum saved when the chunk was written, or None if there is
         none. Raises ValueError for an unsafe id."""
         try:
-            with open(self._checksum_path_for(chunk_id), "rb") as f:
-                return f.read().decode("ascii").strip()
+            return _read_file(self._checksum_path_for(chunk_id)).decode("ascii").strip()
         except FileNotFoundError:
             return None
 
@@ -154,8 +187,7 @@ class ChunkStore:
         it. Raises KeyError if absent, ValueError for an unsafe id."""
         path = self._path_for(chunk_id)
         try:
-            with open(path, "rb") as f:
-                return compute(f.read())
+            return compute(_read_file(path))
         except FileNotFoundError:
             raise KeyError(chunk_id) from None
 
@@ -171,6 +203,6 @@ class ChunkStore:
         with self._lock:
             for p in (path, checksum_path):
                 try:
-                    os.remove(p)
+                    _retry_if_busy(lambda: os.remove(p))
                 except FileNotFoundError:
                     pass
