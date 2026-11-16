@@ -19,11 +19,13 @@ delete_chunk().
 """
 
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from checksum import compute, verify
+from config import HEARTBEAT_TIMEOUT
 from node import ChunkCorrupt, NodeUnavailable
 
 CHUNK_SIZE = 1024 * 1024    # 1 MB, as the project spec says
@@ -66,8 +68,15 @@ class ObjectMetadata:
 
 class Distributor:
     def __init__(self, nodes: list, chunk_size: int = CHUNK_SIZE,
-                 replication_factor: int = REPLICATION_FACTOR):
+                 replication_factor: int = REPLICATION_FACTOR,
+                 heartbeat_timeout: float = HEARTBEAT_TIMEOUT):
         self.nodes = nodes             # list of RemoteNode (the node registry, for now)
+        self.heartbeat_timeout = heartbeat_timeout
+        # What the nodes last told us, so placing a chunk needs no requests:
+        # node_id -> {capacity, used, free, chunks, last_seen}. last_seen is a
+        # time.monotonic() value, or None if the node is known to be down.
+        self._status = {}
+        self._status_lock = threading.Lock()
         self.chunk_size = chunk_size   # a parameter so we can test with tiny chunks
         self.replication_factor = replication_factor
         self.metadata = {}             # object_id -> ObjectMetadata
@@ -88,6 +97,60 @@ class Distributor:
             return [b""]
         return [data[i:i + self.chunk_size] for i in range(0, len(data), self.chunk_size)]
 
+    # ------------------------------------------------------------------
+    # what the nodes told us (heartbeats)
+    # ------------------------------------------------------------------
+    def record_heartbeat(self, node_id: str, capacity: int, used: int, free: int, chunks: int) -> None:
+        """A node reports that it is alive and how much space it has. Called
+        by the API when a heartbeat arrives. Raises KeyError for an unknown
+        node."""
+        self._get_node(node_id)
+        with self._status_lock:
+            self._status[node_id] = {"capacity": capacity, "used": used, "free": free,
+                                     "chunks": chunks, "last_seen": time.monotonic()}
+
+    def _mark_down(self, node_id: str) -> None:
+        """A request to this node just failed: treat it as down at once, rather
+        than waiting for its heartbeat to go stale. A heartbeat revives it."""
+        with self._status_lock:
+            entry = self._status.setdefault(node_id, {"capacity": 0, "used": 0, "free": 0, "chunks": 0})
+            entry["last_seen"] = None
+
+    def _reserve(self, node_id: str, nbytes: int) -> None:
+        """We just stored nbytes on this node: lower its cached free space now,
+        because its next heartbeat may be a moment away and an upload places
+        many chunks in between."""
+        with self._status_lock:
+            entry = self._status.get(node_id)
+            if entry is not None:
+                entry["free"] = max(0, entry["free"] - nbytes)
+
+    def _cached_state(self, node):
+        """(alive, free_space) of a node from the cache, with no request. A node
+        that has never been heard of is asked once, so a controller that just
+        started can place chunks before the first heartbeats arrive."""
+        with self._status_lock:
+            entry = self._status.get(node.node_id)
+        if entry is None:
+            try:
+                h = node.health()
+                self.record_heartbeat(node.node_id, h["capacity"], h["used"], h["free"], h["chunks"])
+            except NodeUnavailable:
+                self._mark_down(node.node_id)
+            with self._status_lock:
+                entry = self._status[node.node_id]
+        seen = entry["last_seen"]
+        alive = seen is not None and time.monotonic() - seen <= self.heartbeat_timeout
+        return alive, entry["free"]
+
+    def heartbeat_age(self, node_id: str):
+        """Seconds since the node last reported, or None if it never has."""
+        with self._status_lock:
+            entry = self._status.get(node_id)
+        if entry is None or entry["last_seen"] is None:
+            return None
+        return round(time.monotonic() - entry["last_seen"], 1)
+
     def _pick_nodes(self, chunk_size: int, count: int, exclude=()):
         """Choose `count` DIFFERENT live nodes that can fit this chunk, most
         free space first (ties keep node-list order). Returns the list, or
@@ -95,19 +158,16 @@ class Distributor:
         `exclude` are never chosen (repair uses this to avoid nodes that
         already hold a copy).
 
-        Asks each node for its health ONCE and decides from that snapshot. An
-        unreachable node is skipped. (Asking separately 'are you alive?' and
-        'how much space?' would cost more requests, and the node could die in
-        between.)"""
+        Decides from what the nodes last reported (heartbeats), so it sends no
+        requests. The picture can be a moment old: if a chosen node turns out
+        to be dead or full, the caller sees the failed write and picks
+        another."""
         candidates = []   # (free_space, node)
         for node in self.nodes:
             if node.node_id in exclude:
                 continue
-            try:
-                free = node.health()["free"]   # one HTTP request per node
-            except NodeUnavailable:
-                continue                       # unreachable: not a candidate
-            if free >= chunk_size:
+            alive, free = self._cached_state(node)
+            if alive and free >= chunk_size:
                 candidates.append((free, node))
 
         if len(candidates) < count:
@@ -190,24 +250,36 @@ class Distributor:
         try:
             for index, chunk in enumerate(chunk_list):
                 chunk_id = f"{object_id}-{index}"
-                targets = self._pick_nodes(len(chunk), self.replication_factor)
 
-                if targets is None:
-                    raise RuntimeError(
-                        f"Not enough storage: need {self.replication_factor} different "
-                        f"live nodes with room for chunk {index}"
-                    )
-
-                for node in targets:
+                # Place the copies one at a time. Placement uses what the nodes
+                # last reported, which can be a moment old, so a chosen node may
+                # turn out to be dead or full: then it is skipped (and a dead
+                # one is marked down) and the next best node is tried. The
+                # upload fails only when there are not enough nodes left.
+                targets = []   # nodes that now hold a copy of this chunk
+                tried = set()  # nodes that failed for this chunk
+                while len(targets) < self.replication_factor:
+                    picked = self._pick_nodes(len(chunk), 1,
+                                              exclude=tried | {n.node_id for n in targets})
+                    if picked is None:
+                        raise RuntimeError(
+                            f"Not enough storage: need {self.replication_factor} different "
+                            f"live nodes with room for chunk {index}"
+                        )
+                    node = picked[0]
                     try:
                         stored = node.store_chunk(chunk_id, chunk)
-                    except (NodeUnavailable, ChunkCorrupt):
-                        stored = False   # down, or the chunk arrived damaged
+                    except NodeUnavailable:
+                        self._mark_down(node.node_id)
+                        stored = False
+                    except ChunkCorrupt:
+                        stored = False   # the chunk arrived damaged
                     if not stored:
-                        raise RuntimeError(
-                            f"Could not store a copy of chunk {index} on {node.node_id}"
-                        )
+                        tried.add(node.node_id)
+                        continue
+                    self._reserve(node.node_id, len(chunk))
                     written.append((chunk_id, node))   # remember this copy for rollback
+                    targets.append(node)
 
                 replica_ids = [n.node_id for n in targets]
                 print(f"[upload] chunk {index} ({len(chunk)} bytes) -> {', '.join(replica_ids)}")
@@ -273,11 +345,15 @@ class Distributor:
         """Try each replica in order; fall back to the next if one is down,
         has lost the chunk, or returns data that fails the checksum."""
         problems = []   # (node_id, what was wrong), for the error message
-        for node_id in info.replicas:
+        # Nodes known to be down (from heartbeats) go last, so they are not
+        # waited for when another copy is available.
+        order = sorted(info.replicas, key=lambda n: not self._cached_state(self._get_node(n))[0])
+        for node_id in order:
             node = self._get_node(node_id)
             try:
                 data = node.get_chunk(info.chunk_id)
             except NodeUnavailable:
+                self._mark_down(node_id)
                 print(f"[download] chunk {info.index}: {node_id} is down, trying next copy")
                 problems.append((node_id, "down"))
                 continue
@@ -497,25 +573,30 @@ class Distributor:
         # reused (storing over it replaces it).
         need = self.replication_factor - len(good)
         bad = [n for n in states if n not in good]
-        targets = self._pick_nodes(len(data), need, exclude=set(info.replicas))
-        if targets is None:
-            targets = self._pick_nodes(len(data), need, exclude=set(good))
-        if targets is None:
-            # not enough room for all: place as many as we can, one at a time
-            targets = []
-            for _ in range(need):
-                picked = self._pick_nodes(len(data), 1, exclude=set(good) | {n.node_id for n in targets})
-                if picked is None:
-                    break
-                targets.append(picked[0])
-
+        # One copy at a time: a node that turns out to be dead or full is
+        # skipped and the next candidate is tried.
         added = []
-        for node in targets:
+        tried = set()
+        while len(added) < need:
+            taken = tried | set(added)
+            picked = self._pick_nodes(len(data), 1, exclude=set(info.replicas) | taken)
+            if picked is None:
+                picked = self._pick_nodes(len(data), 1, exclude=set(good) | taken)
+            if picked is None:
+                break   # no more candidates: the chunk stays short of copies
+            node = picked[0]
             try:
-                if node.store_chunk(info.chunk_id, data):
-                    added.append(node.node_id)
-            except (NodeUnavailable, ChunkCorrupt):
-                pass
+                stored = node.store_chunk(info.chunk_id, data)
+            except NodeUnavailable:
+                self._mark_down(node.node_id)
+                stored = False
+            except ChunkCorrupt:
+                stored = False
+            if stored:
+                self._reserve(node.node_id, len(data))
+                added.append(node.node_id)
+            else:
+                tried.add(node.node_id)
 
         # Record the new layout, unless the object was deleted while we worked
         # (then the new copies must not be left behind).
@@ -549,4 +630,10 @@ class Distributor:
                 except NodeUnavailable:
                     result["left_behind"].append({"node": node_id, "chunk_id": info.chunk_id})
 
-                                                      
+        detail["added"] = added
+        result["copies_created"] += len(added)
+        complete = len(good) + len(added) >= self.replication_factor
+        detail["outcome"] = "repaired" if complete else "partial"
+        print(f"[repair] chunk {info.chunk_id}: now on {', '.join(info.replicas)}"
+              + ("" if complete else " (still short of copies: not enough live nodes with room)"))
+        return detail["outcome"]

@@ -40,6 +40,16 @@ The name and metadata are registered only after every copy of every chunk is
 stored. If any copy cannot be stored, every copy already written is deleted and
 the upload fails with 503, so a chunk is never kept with fewer than two copies.
 
+**Heartbeats:** every node sends `POST /internal/workers/heartbeat` to the
+controller every 2 seconds with its capacity and free space. The controller keeps
+the latest report per node and treats a node that has not reported for 6 seconds
+as down. Placing a chunk reads that table, so it sends no requests to the nodes,
+and an upload is as fast with a dead node as without. Between heartbeats the
+controller lowers a node's cached free space itself each time it stores a chunk.
+If a chosen node turns out to be dead or full, it is skipped (a dead one is
+marked down at once) and the next best node is tried. Downloads try nodes known
+to be down last. A node the controller has never heard from is asked once.
+
 **Download:** look up each chunk's replicas by object ID and read from the first
 one that answers; if its node is down or lost the chunk, fall back to the other
 copy. It fails with 503 only if every copy of some chunk is unavailable.
@@ -93,7 +103,8 @@ GET /api/v1/objects/<object_id>/metadata
 | GET | `/api/v1/objects/<object_id>/metadata` | The object's metadata | 404 unknown id |
 | PATCH | `/api/v1/objects/<object_id>/metadata` | Add/update custom metadata (JSON object; `null` removes a key) | 400 bad body, 404 unknown id |
 | DELETE | `/api/v1/objects/<object_id>` | Delete the object and all copies of its chunks, returns 204 | 404 unknown id |
-| GET | `/api/v1/nodes` | Debug: up/down, capacity, used, free and chunk count per node | |
+| POST | `/internal/workers/heartbeat` | Sent by each node every 2 s: `worker_id`, `capacity`, `used`, `free`, `chunks` | 400 bad body, 404 unknown worker |
+| GET | `/api/v1/nodes` | Debug: up/down, capacity, used, free, chunk count and seconds since the last heartbeat per node | |
 | GET | `/api/v1/replication` | Debug: health of every chunk and the state of each copy | |
 | POST | `/api/v1/repair` | Re-replicate under-replicated and corrupt chunks; returns what was done | 409 a repair is already running |
 
@@ -153,6 +164,8 @@ python app.py       # the API on port 5000
 python client.py    # menu: upload, download, list, show/update metadata, delete
 ```
 
+Each node reports to the controller at `CONTROLLER_URL` (default
+`http://127.0.0.1:5000`; set it on the node server if the API runs elsewhere).
 Each node holds 5 MB by default (`CAPACITY` on the node server) and keeps its
 chunks under `./data/<NODE_ID>`. Every chunk is stored twice, so four nodes hold
 about 10 MB of files. Node addresses are in `config.py`.
@@ -177,7 +190,11 @@ python client.py                                                 # download stil
   automatically yet.
 - Copies left on a node that was down during repair stay on its disk as orphans
   (they are listed, not cleaned up).
-- Nodes are listed in `config.py`; there is no registration or heartbeat yet.
+- Nodes are listed in `config.py`; there is no registration yet (heartbeats exist,
+  but only for the nodes in that list).
+- The controller's picture of the nodes is up to a heartbeat old (2 s). A node
+  that has just died can still be chosen once: the failed write is noticed, the
+  node is marked down at once and the next node is used.
 - The client wraps each file in a small header (see "Serialized format"), so the
   bytes stored on the nodes are that wrapped form. `size` still reports the
   original size, but a download with a browser or `curl` returns the wrapped

@@ -253,9 +253,11 @@ def show_nodes():
                 "used": h["used"],
                 "free": h["free"],
                 "chunks": h["chunks"],
+                "heartbeat_age": distributor.heartbeat_age(n.node_id),
             })
         except NodeUnavailable:
-            report.append({"node": n.node_id, "alive": False})
+            report.append({"node": n.node_id, "alive": False,
+                           "heartbeat_age": distributor.heartbeat_age(n.node_id)})
     return jsonify(report)
 
 
@@ -264,6 +266,25 @@ def show_replication():
     """Debug endpoint: health of every chunk (healthy / under_replicated /
     unavailable). Read-only: it reports problems, it does not repair them."""
     return jsonify(distributor.replication_report())
+
+
+@app.route("/internal/workers/heartbeat", methods=["POST"])
+def worker_heartbeat():
+    """A worker reports that it is alive and how much space it has:
+    {"worker_id", "capacity", "used", "free", "chunks"}. The controller keeps the
+    latest report per worker and places chunks from it without asking the
+    workers. 400 for a bad body, 404 for a worker that is not in config.py."""
+    body = request.get_json(silent=True)
+    fields = ("capacity", "used", "free", "chunks")
+    if (not isinstance(body, dict) or not isinstance(body.get("worker_id"), str)
+            or any(type(body.get(f)) is not int or body[f] < 0 for f in fields)):
+        return error("Body must be JSON with a 'worker_id' string and non-negative "
+                     "integers 'capacity', 'used', 'free' and 'chunks'", 400)
+    try:
+        distributor.record_heartbeat(body["worker_id"], *(body[f] for f in fields))
+    except KeyError:
+        return error(f"Unknown worker '{body['worker_id']}'", 404)
+    return jsonify({"status": "ok"})
 
 
 @app.route("/api/v1/repair", methods=["POST"])

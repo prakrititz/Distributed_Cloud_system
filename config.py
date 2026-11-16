@@ -15,6 +15,15 @@ NODE_ADDRESSES = {
     "Node4": "http://127.0.0.1:5004",
 }
 
+# Heartbeats: every node tells the controller "I'm alive, this much space is
+# free" every HEARTBEAT_INTERVAL seconds. The controller keeps the latest
+# report per node and treats a node that has not reported for HEARTBEAT_TIMEOUT
+# seconds as down (3 missed beats), so placing a chunk needs no requests.
+HEARTBEAT_INTERVAL = 2
+HEARTBEAT_TIMEOUT = 6
+# Where the node servers send their heartbeats (the Flask API in app.py).
+CONTROLLER_URL = "http://127.0.0.1:5000"
+
 # Seconds to wait for a node before treating it as down.
 # Two separate limits: how long to wait for a connection (short, so a dead
 # node is given up on quickly) and how long to wait for an answer once
