@@ -106,6 +106,62 @@ class TestCleanup:
         assert nodes[victim].chunks == {}
         assert d.download(oid)
 
+    @staticmethod
+    def repaired_while_down(d, nodes):
+        """One chunk; its copy on `victim` is replaced by repair while victim is
+        down; victim comes back with its old (now orphaned) copy. Returns
+        (object_id, chunk_id, victim, the worker repair copied to)."""
+        oid = d.upload("f", os.urandom(100))
+        before = list(d.get_object(oid).chunks[0].replicas)
+        victim = before[0]
+        nodes[victim].down = True
+        d.repair()
+        new = next(n for n in d.get_object(oid).chunks[0].replicas if n not in before)
+        nodes[victim].down = False
+        d.record_heartbeat(victim, 10 ** 9, 0, 10 ** 9, 0)
+        return oid, f"{oid}-0", victim, new
+
+    def test_a_good_orphan_is_kept_when_the_chunk_is_short_of_good_copies(self, setup):
+        d, nodes = setup
+        oid, cid, victim, new = self.repaired_while_down(d, nodes)
+        nodes[new].damage(cid)                                    # the replacement copy goes bad
+        r = d.cleanup_orphans(min_age=0)
+        assert r["adopted"] == [{"node": victim, "chunk_id": cid}]
+        assert {"node": victim, "chunk_id": cid} not in r["deleted"]
+        assert cid in nodes[victim].chunks                        # not deleted
+        replicas = d.get_object(oid).chunks[0].replicas
+        assert victim in replicas and new not in replicas and len(replicas) == 2   # never more than required
+        assert d.replication_report()["summary"]["healthy"] == 1
+        # the damaged copy is now the orphan and the chunk has enough good copies, so it
+        # goes: in the same run if that worker is looked at after the victim, else in the next
+        d.cleanup_orphans(min_age=0)
+        assert cid not in nodes[new].chunks
+        assert d.download(oid)
+
+    def test_a_surplus_orphan_is_deleted_when_the_chunk_has_enough_good_copies(self, setup):
+        d, nodes = setup
+        oid, cid, victim, new = self.repaired_while_down(d, nodes)
+        r = d.cleanup_orphans(min_age=0)
+        assert r["deleted"] == [{"node": victim, "chunk_id": cid}] and r["adopted"] == []
+        assert len(d.get_object(oid).chunks[0].replicas) == 2
+
+    def test_a_damaged_orphan_is_never_adopted(self, setup):
+        d, nodes = setup
+        oid, cid, victim, new = self.repaired_while_down(d, nodes)
+        nodes[new].damage(cid)
+        nodes[victim].damage(cid)                                 # the old copy is bad as well
+        r = d.cleanup_orphans(min_age=0)
+        assert r["adopted"] == [] and {"node": victim, "chunk_id": cid} in r["deleted"]
+        assert victim not in d.get_object(oid).chunks[0].replicas
+
+    def test_the_adoption_is_saved(self, setup, tmp_path):
+        d, nodes = setup
+        oid, cid, victim, new = self.repaired_while_down(d, nodes)
+        nodes[new].damage(cid)
+        d.cleanup_orphans(min_age=0)
+        fresh = Distributor(list(nodes.values()), chunk_size=100, store=JsonFileStore(d.store.path))
+        assert victim in fresh.get_object(oid).chunks[0].replicas
+
     def test_a_down_worker_is_skipped(self, setup):
         d, nodes = setup
         d.upload("f", os.urandom(100))

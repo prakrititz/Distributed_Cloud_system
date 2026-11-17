@@ -834,8 +834,58 @@ class Distributor:
             "missing": sorted(c for c in expected if c not in held_ids),
         }
 
+    def _chunk_info(self, chunk_id: str):
+        """(ObjectMetadata, ChunkInfo) of a chunk, or (None, None) if its object is gone."""
+        with self._lock:
+            meta = self.metadata.get(self._object_of(chunk_id))
+            if meta is None:
+                return None, None
+            for info in meta.chunks:
+                if info.chunk_id == chunk_id:
+                    return meta, info
+        return None, None
+
+    def _adopt_if_needed(self, node, chunk_id: str) -> bool:
+        """An orphaned copy is about to be deleted. If its chunk has FEWER good
+        copies than required and this copy is intact (it matches the checksum
+        recorded at upload), take it back into the chunk's replica list
+        instead, so cleanup never lowers a chunk's good copies. Returns True if
+        the copy was adopted (and must not be deleted)."""
+        meta, info = self._chunk_info(chunk_id)
+        if info is None:
+            return False                                  # its object was deleted: just an orphan
+        states = {n: self._check_copy(n, info) for n in list(info.replicas)}
+        good = [n for n, s in states.items() if s == "ok"]
+        if len(good) >= self.replication_factor:
+            return False                                  # enough good copies: this one is surplus
+        try:
+            intact = node.get_checksum(chunk_id)["checksum"] == info.checksum
+        except (KeyError, ValueError, NodeUnavailable):
+            intact = False
+        if not intact:
+            return False                                  # damaged too: no use keeping it
+        with self._lock:
+            if self.metadata.get(meta.object_id) is not meta or node.node_id in info.replicas:
+                return False
+            new = good + [node.node_id]
+            short = max(0, self.replication_factor - len(new))
+            # a copy on a worker that is only down may come back: keep it while still short
+            new += [n for n in info.replicas if states.get(n) == "down" and n not in new][:short]
+            info.replicas = new
+            self._save()
+        self._note_copies(info.replicas)
+        print(f"[cleanup] chunk {chunk_id} had only {len(good)} good copy/copies: "
+              f"kept the intact copy on {node.node_id} instead of deleting it")
+        return True
+
     def cleanup_orphans(self, min_age: float = 60.0) -> dict:
         """Delete orphaned chunks on every reachable worker.
+
+        Never lowers a chunk below the required number of good copies: an
+        orphan whose chunk is short of good copies, and that is itself intact,
+        is taken back into the chunk's replica list ('adopted') instead of
+        being deleted. Only surplus copies (the chunk already has enough good
+        copies), damaged ones, and copies of deleted objects are deleted.
 
         Safe only if the metadata is the full truth: with metadata kept only
         in memory, a controller that has just restarted knows no objects and
@@ -849,7 +899,7 @@ class Distributor:
         if not self._repair_lock.acquire(blocking=False):
             raise RuntimeError("A repair or cleanup is already running")
         try:
-            result = {"deleted": [], "kept_young": [], "unreachable": []}
+            result = {"deleted": [], "adopted": [], "kept_young": [], "unreachable": []}
             for node in list(self.nodes):
                 try:
                     report = self.worker_inventory(node.node_id)
@@ -866,6 +916,9 @@ class Distributor:
                     if c["chunk_id"] in self._expected_on(node.node_id) \
                             or self._object_of(c["chunk_id"]) in self._in_flight:
                         continue
+                    if self._adopt_if_needed(node, c["chunk_id"]):
+                        result["adopted"].append(entry)
+                        continue
                     try:
                         node.delete_chunk(c["chunk_id"])
                         result["deleted"].append(entry)
@@ -873,7 +926,7 @@ class Distributor:
                         result["unreachable"].append(node.node_id)
                         break
             print(f"[cleanup] deleted {len(result['deleted'])} orphaned chunk(s), "
-                  f"kept {len(result['kept_young'])} recent one(s)")
+                  f"adopted {len(result['adopted'])}, kept {len(result['kept_young'])} recent one(s)")
             return result
         finally:
             self._repair_lock.release()

@@ -103,10 +103,14 @@ repair runs at a time (409 otherwise).
 worker that was down while its chunks were repaired elsewhere, or a delete that
 could not reach a worker. `GET /internal/workers/<id>/chunks` compares what a
 worker holds with the metadata (orphans and missing chunks).
-`POST /api/v1/cleanup` deletes the orphans. It never touches a chunk of an
-upload in progress or one younger than `min_age` seconds (60 by default), and it
-works only with saved metadata, since an empty in-memory controller would see
-every chunk as an orphan.
+`POST /api/v1/cleanup` deletes the orphans. It never lowers a chunk below the
+required number of good copies: if a chunk is short of good copies and an
+orphan of it is intact (it matches the recorded checksum), that copy is taken
+back into the chunk's replica list ("adopted") instead of being deleted. It
+never touches a chunk of an upload in progress or one younger than `min_age`
+seconds (60 by default; the age is the time since the copy was written on that
+worker), and it works only with saved metadata, since an empty in-memory
+controller would see every chunk as an orphan.
 
 **Persistent metadata:** all metadata is saved to `METADATA_PATH` after every
 change (written to a temp file, then renamed, so a crash never leaves a
