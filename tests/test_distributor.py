@@ -471,21 +471,35 @@ class TestReplicationReport:
     def test_each_kind_of_problem_is_named(self, make_distributor):
         d, nodes = make_distributor()
         oid = d.upload("f", os.urandom(400))
-        c0, c1, c2, c3 = chunks_of(d, oid)
+        chunks = chunks_of(d, oid)
         by_id = {n.node_id: n for n in nodes}
-        # placement is deterministic here: chunks 0 and 2 are on N1+N2, chunks 1 and 3 on N3+N4
-        assert sorted(c0.replicas) == sorted(c2.replicas) == ["N1", "N2"]
-        assert sorted(c1.replicas) == sorted(c3.replicas) == ["N3", "N4"]
-        by_id["N1"].down = True                       # chunks 0 and 2 lose their copy on N1
-        by_id["N2"].lose(c2.chunk_id)                 # chunk 2 also loses its other copy
-        by_id["N3"].damage(c1.chunk_id)               # chunk 1 has one damaged copy
+        # One fault of each kind, chosen from wherever the copies actually landed:
+        down = chunks[0].replicas[0]                                   # a whole node goes down
+        lost = (chunks[2].index, next(n for n in chunks[2].replicas if n != down))
+        damaged = (chunks[1].index, next(n for n in chunks[1].replicas if n != down))
+        by_id[down].down = True
+        by_id[lost[1]].lose(chunks[2].chunk_id)
+        by_id[damaged[1]].damage(chunks[1].chunk_id)
+
+        def expected_state(index, node):
+            if node == down:
+                return "down"
+            if (index, node) == lost:
+                return "missing"
+            if (index, node) == damaged:
+                return "corrupt"
+            return "ok"
+
         r = d.replication_report()
         states = {ch["index"]: {rep["node"]: rep["state"] for rep in ch["replicas"]} for ch in r["chunks"]}
-        assert states[0] == {"N1": "down", "N2": "ok"}
-        assert states[1] == {"N3": "corrupt", "N4": "ok"}
-        assert states[2] == {"N1": "down", "N2": "missing"}
-        assert states[3] == {"N3": "ok", "N4": "ok"}
-        assert r["summary"] == {"total_chunks": 4, "healthy": 1, "under_replicated": 2, "unavailable": 1}
+        for c in chunks:
+            assert states[c.index] == {n: expected_state(c.index, n) for n in c.replicas}
+        assert {"down", "missing", "corrupt", "ok"} <= {s for st in states.values() for s in st.values()}
+        good = {i: sum(s == "ok" for s in st.values()) for i, st in states.items()}
+        assert r["summary"] == {"total_chunks": 4,
+                                "healthy": sum(g == 2 for g in good.values()),
+                                "under_replicated": sum(g == 1 for g in good.values()),
+                                "unavailable": sum(g == 0 for g in good.values())}
 
     def test_a_corrupt_copy_is_not_counted_as_usable(self, make_distributor):
         d, nodes = make_distributor()
@@ -675,3 +689,50 @@ class TestRepair:
         assert live_chunks == set()
         with pytest.raises(KeyError):
             d.get_object(oid)
+
+
+# ============================================================ spreading copies (issue #16)
+class TestSpread:
+    @staticmethod
+    def pair_counts(d):
+        from collections import Counter
+        return Counter(frozenset(c.replicas) for m in d.list_objects() for c in m.chunks)
+
+    def test_with_four_equal_workers_every_pair_is_used_about_equally(self, make_distributor):
+        d, _ = make_distributor(4, chunk_size=100)
+        for i in range(10):
+            d.upload(f"f{i}", os.urandom(600))                  # 60 chunks
+        counts = self.pair_counts(d)
+        assert len(counts) == 6                                  # all C(4,2) pairs are used
+        assert max(counts.values()) - min(counts.values()) <= 3, counts
+
+    def test_losing_any_two_workers_loses_only_a_few_chunks(self, make_distributor):
+        import itertools
+        d, nodes = make_distributor(4, chunk_size=100)
+        for i in range(10):
+            d.upload(f"f{i}", os.urandom(600))
+        total = sum(len(m.chunks) for m in d.list_objects())
+        for a, b in itertools.combinations([n.node_id for n in nodes], 2):
+            lost = sum(1 for m in d.list_objects() for c in m.chunks if set(c.replicas) == {a, b})
+            assert lost / total <= 0.25, (a, b, lost)            # about 1/6 each; fixed pairs lost 1/2
+
+    def test_six_workers_spread_too(self, make_distributor):
+        d, _ = make_distributor(6, chunk_size=100)
+        for i in range(15):
+            d.upload(f"f{i}", os.urandom(1000))                  # 150 chunks
+        counts = self.pair_counts(d)
+        assert len(counts) == 15 and max(counts.values()) <= 3 * min(counts.values()), counts
+
+    def test_a_full_worker_is_never_chosen(self, make_distributor):
+        d, nodes = make_distributor(4, chunk_size=100, capacity=10 ** 9)
+        nodes[0].capacity = 0
+        d._status.clear()                                         # let the controller see the new capacity
+        oid = d.upload("f", os.urandom(1000))
+        assert all("N1" not in c.replicas for c in d.get_object(oid).chunks)
+
+    def test_free_space_still_matters(self, make_distributor):
+        d, nodes = make_distributor(4, chunk_size=100, capacity=10 ** 6)
+        nodes[3].capacity = 10 ** 9                               # N4 has far more room
+        d._status.clear()
+        oid = d.upload("f", os.urandom(1000))
+        assert all("N4" in c.replicas for c in d.get_object(oid).chunks)

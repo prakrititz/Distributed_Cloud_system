@@ -4,19 +4,25 @@ the node servers (nodes/node_server.py) over HTTP through RemoteNode objects.
 Objects are identified by the object_id returned from an upload. The file name
 is only metadata: several objects can share it.
 
-Start the 4 node servers first (see nodes/node_server.py), then this app. Each
-node's capacity is set on its own server (CAPACITY), not here.
+Workers register themselves when they start (POST /internal/workers/register),
+so start them in any order, and as many as you like. Each worker's capacity is
+set on its own server (CAPACITY), not here. The chunk size and the number of
+copies per chunk are CHUNK_SIZE and REPLICATION_FACTOR (see config.py).
 """
 import io
 import json
 import mimetypes
 import os
+import threading
+import time
 
 from flask import Flask, request, jsonify, send_file
 from werkzeug.exceptions import HTTPException
 
-from config import NODE_ADDRESSES
+from config import (AUTO_REPAIR_GRACE, CHUNK_SIZE, HEARTBEAT_INTERVAL, METADATA_PATH, NODE_ADDRESSES,
+                    ORPHAN_MIN_AGE, REPLICATION_FACTOR)
 from controller.distributor import DEFAULT_CONTENT_TYPE, Distributor
+from controller.metadata_store import store_from_setting
 from controller.remote_node import RemoteNode
 from helpers.checksum import compute, verify
 from helpers.errors import NodeUnavailable
@@ -25,11 +31,35 @@ app = Flask(__name__)
 
 MAX_CLIENT_ID_LENGTH = 128
 
-# One RemoteNode per address in config.py. The distributor calls their methods
-# (store_chunk, get_chunk, ...) and each call becomes an HTTP request to that
-# node's server.
-nodes = [RemoteNode(node_id, url) for node_id, url in NODE_ADDRESSES.items()]
-distributor = Distributor(nodes)
+# One RemoteNode per worker. The distributor calls their methods (store_chunk,
+# get_chunk, ...) and each call becomes an HTTP request to that worker's server.
+# Workers listed in config.WORKERS are known from the start; every other worker
+# is added when it registers.
+# The metadata is saved to METADATA_PATH after every change and loaded here,
+# so restarting the controller keeps every object.
+distributor = Distributor([RemoteNode(node_id, url) for node_id, url in NODE_ADDRESSES.items()],
+                          chunk_size=CHUNK_SIZE, replication_factor=REPLICATION_FACTOR,
+                          store=store_from_setting(METADATA_PATH))
+auto_repair = {"enabled": False, "grace_seconds": AUTO_REPAIR_GRACE}   # switched on in __main__
+
+
+def auto_repair_loop(grace: float, interval: float = HEARTBEAT_INTERVAL) -> None:
+    """Background thread: every `interval` seconds see whether a worker has
+    been down for `grace` seconds, and if so repair (Distributor.auto_repair_check)."""
+    while True:
+        try:
+            distributor.auto_repair_check(grace)
+        except Exception as e:            # never let the thread die
+            print(f"[auto-repair] check failed: {e}")
+        time.sleep(interval)
+
+
+def start_auto_repair(grace: float = AUTO_REPAIR_GRACE) -> bool:
+    if grace <= 0:
+        return False
+    auto_repair.update(enabled=True, grace_seconds=grace)
+    threading.Thread(target=auto_repair_loop, args=(grace,), daemon=True).start()
+    return True
 
 
 def error(message: str, status: int):
@@ -100,8 +130,8 @@ def upload_object():
                   scopes the 'path' rule: two clients may each upload their
                   own '/files/a.txt'. Without it, uploads share one anonymous
                   scope
-      'size'      size of the original object, if the uploaded bytes are a
-                  wrapped form of it (defaults to the uploaded size)
+      'size'      size to record, if it differs from the uploaded size
+                  (defaults to the uploaded size)
 
     201 with the new object's metadata. 400 for a bad field or a checksum
     mismatch (nothing is stored), 409 if an object from this path exists,
@@ -256,7 +286,7 @@ def show_nodes():
     Asks each node's server for its health; a node that cannot be reached
     is listed as down. To test a failure, stop that node's server process."""
     report = []
-    for n in nodes:
+    for n in distributor.nodes:
         try:
             h = n.health()   # one request per node
             report.append({
@@ -277,8 +307,47 @@ def show_nodes():
 @app.route("/api/v1/replication", methods=["GET"])
 def show_replication():
     """Debug endpoint: health of every chunk (healthy / under_replicated /
-    unavailable). Read-only: it reports problems, it does not repair them."""
-    return jsonify(distributor.replication_report())
+    unavailable). Read-only: it reports problems, it does not repair them.
+    'auto_repair' says whether automatic repair is on and what it last did."""
+    report = distributor.replication_report()
+    report["auto_repair"] = {**auto_repair, "last": distributor.last_auto_repair}
+    return jsonify(report)
+
+
+SPACE_FIELDS = ("capacity", "used", "free", "chunks")
+MAX_WORKER_ID_LENGTH = 64
+
+
+def worker_report(body):
+    """Check a register/heartbeat body: a 'worker_id' string and non-negative
+    integers for the space fields. Returns an error message, or None if fine."""
+    if (not isinstance(body, dict) or not isinstance(body.get("worker_id"), str)
+            or not body["worker_id"].strip() or len(body["worker_id"]) > MAX_WORKER_ID_LENGTH
+            or any(type(body.get(f)) is not int or body[f] < 0 for f in SPACE_FIELDS)):
+        return (f"Body must be JSON with a 'worker_id' string (1-{MAX_WORKER_ID_LENGTH} characters) "
+                "and non-negative integers 'capacity', 'used', 'free' and 'chunks'")
+    return None
+
+
+@app.route("/internal/workers/register", methods=["POST"])
+def register_worker():
+    """A worker announces itself when it starts:
+    {"worker_id", "url", "capacity", "used", "free", "chunks"}, where url is the
+    address the controller can reach it at. From then on it is used for
+    placement. A worker that registers again with the same id (a restart)
+    replaces its old entry, so its address is updated. 201 for a new worker,
+    200 for a known one, 400 for a bad body."""
+    body = request.get_json(silent=True)
+    problem = worker_report(body)
+    url = body.get("url") if isinstance(body, dict) else None
+    if problem is None and (not isinstance(url, str) or not url.startswith(("http://", "https://"))):
+        problem = "'url' must be the worker's address, starting with http:// or https://"
+    if problem:
+        return error(problem, 400)
+    worker_id = body["worker_id"].strip()
+    is_new = distributor.register_node(RemoteNode(worker_id, url), *(body[f] for f in SPACE_FIELDS))
+    print(f"[controller] worker {worker_id} {'registered' if is_new else 're-registered'} at {url}", flush=True)
+    return jsonify({"status": "registered", "worker_id": worker_id, "new": is_new}), 201 if is_new else 200
 
 
 @app.route("/internal/workers/heartbeat", methods=["POST"])
@@ -286,18 +355,48 @@ def worker_heartbeat():
     """A worker reports that it is alive and how much space it has:
     {"worker_id", "capacity", "used", "free", "chunks"}. The controller keeps the
     latest report per worker and places chunks from it without asking the
-    workers. 400 for a bad body, 404 for a worker that is not in config.py."""
+    workers. 400 for a bad body, 404 for a worker that has not registered
+    (for example after the controller restarted): the worker then registers."""
     body = request.get_json(silent=True)
-    fields = ("capacity", "used", "free", "chunks")
-    if (not isinstance(body, dict) or not isinstance(body.get("worker_id"), str)
-            or any(type(body.get(f)) is not int or body[f] < 0 for f in fields)):
-        return error("Body must be JSON with a 'worker_id' string and non-negative "
-                     "integers 'capacity', 'used', 'free' and 'chunks'", 400)
+    problem = worker_report(body)
+    if problem:
+        return error(problem, 400)
     try:
-        distributor.record_heartbeat(body["worker_id"], *(body[f] for f in fields))
+        distributor.record_heartbeat(body["worker_id"], *(body[f] for f in SPACE_FIELDS))
     except KeyError:
-        return error(f"Unknown worker '{body['worker_id']}'", 404)
+        return error(f"Unknown worker '{body['worker_id']}': register first", 404)
     return jsonify({"status": "ok"})
+
+
+@app.route("/internal/workers/<worker_id>/chunks", methods=["GET"])
+def worker_chunks(worker_id):
+    """What a worker really holds compared with what the metadata says:
+    {worker_id, held, expected, orphans, in_progress, missing}.
+    404 unknown worker, 503 if it cannot be reached."""
+    try:
+        return jsonify(distributor.worker_inventory(worker_id))
+    except KeyError:
+        return error(f"Unknown worker '{worker_id}'", 404)
+    except NodeUnavailable as e:
+        return error(str(e), 503)
+
+
+@app.route("/api/v1/cleanup", methods=["POST"])
+def cleanup():
+    """Delete orphaned chunks (held by a worker, but no object points to that
+    copy) on every reachable worker. Chunks younger than 'min_age' seconds
+    (query parameter, default ORPHAN_MIN_AGE) are left alone. 409 if the
+    metadata is not saved (then it is not safe) or a repair is running."""
+    try:
+        min_age = float(request.args.get("min_age", ORPHAN_MIN_AGE))
+        if min_age < 0:
+            raise ValueError
+    except ValueError:
+        return error("'min_age' must be a non-negative number of seconds", 400)
+    try:
+        return jsonify(distributor.cleanup_orphans(min_age))
+    except RuntimeError as e:
+        return error(str(e), 409)
 
 
 @app.route("/api/v1/repair", methods=["POST"])
@@ -316,6 +415,9 @@ if __name__ == "__main__":
     # own empty copy of the nodes, which is confusing while we're learning.
     # HOST=0.0.0.0 is needed inside a container, otherwise nothing outside it
     # can connect. Debug mode (the interactive debugger) is off unless DEBUG=1.
+    if start_auto_repair():
+        print(f"[controller] automatic repair on: after a worker is down for {AUTO_REPAIR_GRACE} s")
+    print(f"[controller] metadata: {os.path.abspath(METADATA_PATH) if METADATA_PATH else 'in memory only'}")
     app.run(host=os.environ.get("HOST", "127.0.0.1"),
             port=int(os.environ.get("PORT", "5000")),
             debug=os.environ.get("DEBUG") == "1",
