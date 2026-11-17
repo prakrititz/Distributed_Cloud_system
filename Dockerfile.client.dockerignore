@@ -1,0 +1,8 @@
+# Allowlist for the CLIENT image: exclude everything, then let in only what
+# client.py needs.
+*
+!client.py
+!helpers/
+!requirements.txt
+**/__pycache__
+**/*.pyc
