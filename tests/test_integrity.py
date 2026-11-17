@@ -6,7 +6,7 @@ import requests
 
 from tests.util import MB, TIMEOUT, download, replicas_of, upload, upload_ok
 
-NODES = ("Node1", "Node2", "Node3", "Node4")
+NODES = ("worker1", "worker2", "worker3", "worker4")
 
 
 def first_chunk(cluster, object_id):

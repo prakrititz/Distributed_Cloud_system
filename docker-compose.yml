@@ -1,0 +1,106 @@
+# The whole system: 1 controller + N workers on one private network, plus two
+# client containers you start when you need them.
+#
+#     docker compose up --build -d      start (builds the images the first time)
+#     docker compose ps                 what is running
+#     docker compose logs -f            follow the logs
+#     docker compose run --rm client1 upload /files/hello.txt     use a client
+#     docker compose down               stop and remove the containers (the data volumes are kept)
+#     docker compose down -v            ... and delete all stored data too
+#
+# ---------------------------------------------------------------- SETTINGS
+# Change the numbers here, or override one for a single run, e.g.
+#     WORKERS=6 docker compose up -d            (PowerShell: $env:WORKERS=6; docker compose up -d)
+#     docker compose up -d --scale worker=6     (changes only the number of workers)
+x-settings:
+  workers:            &workers            ${WORKERS:-4}                # number of worker containers
+  chunk_size:         &chunk_size         ${CHUNK_SIZE:-1048576}       # bytes per chunk (1 MB)
+  replication_factor: &replication_factor ${REPLICATION_FACTOR:-2}     # copies of every chunk
+  worker_capacity:    &worker_capacity    ${WORKER_CAPACITY:-5242880}  # bytes each worker may store (5 MB)
+  worker_name:        &worker_name        ${WORKER_NAME:-worker}       # workers are called worker1, worker2, ...
+  api_port:           &api_port           ${API_PORT:-5000}            # the API on this machine: http://127.0.0.1:5000
+  auto_repair_grace:  &auto_repair_grace  ${AUTO_REPAIR_GRACE:-30}     # seconds a worker may be down before repair starts (0: off)
+# -------------------------------------------------------------------------
+#
+# How it fits together:
+#   - "store" is a private network: containers reach each other by name
+#     (the workers and clients use http://controller:5000). Only the
+#     controller's port is published to this machine.
+#   - There is ONE worker service started `workers` times. Docker names the
+#     containers object-store-worker-1, -2, ...; each one turns that number
+#     into its id (worker1, worker2, ...) and registers with the controller,
+#     so the controller needs no list of workers.
+#   - Volumes (they survive stopping, re-creating and rebuilding):
+#       worker-data      all workers; each keeps its chunks in its own folder
+#                        (/data/worker1, /data/worker2, ...)
+#       controller-data  the controller's saved metadata (/meta/metadata.json)
+#   - Clients (profile "clients": not started by `up`, run them when needed):
+#       client1, client2 have their own CLIENT_ID, read files from ./files
+#       and save downloads in ./downloads/client1, ./downloads/client2.
+#   - Failure demo:  docker stop object-store-worker-2   /   docker start object-store-worker-2
+
+name: object-store
+
+x-client: &client
+  build:
+    context: .
+    dockerfile: Dockerfile.client
+  image: object-store-client
+  profiles: [clients]
+  networks: [store]
+  stdin_open: true          # so the menu works with `docker compose run`
+  tty: true
+
+services:
+  controller:
+    build:
+      context: .
+      dockerfile: Dockerfile.controller
+    image: object-store-controller
+    environment:
+      CHUNK_SIZE: *chunk_size
+      REPLICATION_FACTOR: *replication_factor
+      AUTO_REPAIR_GRACE: *auto_repair_grace
+    ports:
+      - target: 5000
+        published: *api_port
+    volumes:
+      - controller-data:/meta
+    networks: [store]
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    image: object-store-worker
+    deploy:
+      replicas: *workers
+    environment:
+      CAPACITY: *worker_capacity
+      WORKER_NAME: *worker_name
+    volumes:
+      - worker-data:/data
+    networks: [store]
+
+  client1:
+    <<: *client
+    environment:
+      CLIENT_ID: client1
+    volumes:
+      - ./files:/files:ro
+      - ./downloads/client1:/downloads
+
+  client2:
+    <<: *client
+    environment:
+      CLIENT_ID: client2
+    volumes:
+      - ./files:/files:ro
+      - ./downloads/client2:/downloads
+
+networks:
+  store: {}
+
+volumes:
+  worker-data: {}
+  controller-data: {}

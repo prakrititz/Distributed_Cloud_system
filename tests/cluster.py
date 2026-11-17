@@ -19,7 +19,7 @@ import requests
 from werkzeug.serving import make_server
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NODE_IDS = ["Node1", "Node2", "Node3", "Node4"]
+NODE_IDS = ["worker1", "worker2", "worker3", "worker4"]
 HEARTBEAT_INTERVAL = 0.5     # seconds between a node's heartbeats in the tests
 HEARTBEAT_TIMEOUT = 2.0      # silent this long -> the controller treats the node as down
 
@@ -47,6 +47,7 @@ class Cluster:
         self.node_ports = {n: free_port() for n in NODE_IDS}
         self.api_port = free_port()
         self.procs = {}
+        self.extra = {}       # node_id -> port of workers started by a test, NOT in the WORKERS list
         self.server = None
         self.app_module = None
 
@@ -56,6 +57,8 @@ class Cluster:
         # imported, so set it before importing app.
         os.environ["WORKERS"] = ",".join(
             f"{n}=http://127.0.0.1:{p}" for n, p in self.node_ports.items())
+        # the metadata is saved like in the real deployment (and cleanup needs it)
+        os.environ["METADATA_PATH"] = self.metadata_path
         # Only app and config are imported afresh. The controller.* modules are
         # left alone, so every test module sees the same Distributor/RemoteNode
         # classes (and the ones fixtures patch).
@@ -63,6 +66,7 @@ class Cluster:
             sys.modules.pop(name, None)
         self.app_module = importlib.import_module("app")
         os.environ.pop("WORKERS", None)       # config has read it; do not leak it into other tests
+        os.environ.pop("METADATA_PATH", None)
         self.distributor.heartbeat_timeout = HEARTBEAT_TIMEOUT
 
         self.server = make_server("127.0.0.1", self.api_port, self.app_module.app, threaded=True)
@@ -78,16 +82,39 @@ class Cluster:
         if self.server:
             self.server.shutdown()
 
-    def _spawn(self, node_id: str) -> None:
+    def _spawn(self, node_id: str, port: int = None, controller_url: str = None) -> None:
+        port = port or self.node_ports[node_id]
         env = dict(
-            os.environ, NODE_ID=node_id, PORT=str(self.node_ports[node_id]), HOST="127.0.0.1",
+            os.environ, NODE_ID=node_id, PORT=str(port), HOST="127.0.0.1",
             CAPACITY=str(self.capacity), DATA_DIR=self.node_dir(node_id),
-            CONTROLLER_URL=f"http://127.0.0.1:{self.api_port}",
+            CONTROLLER_URL=controller_url or f"http://127.0.0.1:{self.api_port}",
             HEARTBEAT_INTERVAL=str(HEARTBEAT_INTERVAL),
         )
+        env.pop("ADVERTISE_URL", None)
         self.procs[node_id] = subprocess.Popen(
             [sys.executable, "-m", "nodes.node_server"], env=env, cwd=REPO_ROOT,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def start_extra(self, node_id: str, controller_url: str = None) -> int:
+        """Start a worker the controller has never heard of (not in WORKERS):
+        it has to register itself. Returns its port. reset() removes it."""
+        port = free_port()
+        self.extra[node_id] = port
+        self._spawn(node_id, port, controller_url)
+        return port
+
+    def _remove_extras(self) -> None:
+        for node_id in list(self.extra):
+            self.kill(node_id)
+            self.procs.pop(node_id, None)
+            shutil.rmtree(self.node_dir(node_id), ignore_errors=True)
+            del self.extra[node_id]
+        d = self.distributor
+        with d._nodes_lock:
+            d.nodes = [n for n in d.nodes if n.node_id in NODE_IDS]
+        with d._status_lock:
+            for node_id in [k for k in d._status if k not in NODE_IDS]:
+                del d._status[node_id]
 
     # --- convenient views --------------------------------------------------
     @property
@@ -103,7 +130,12 @@ class Cluster:
         return self.app_module.distributor
 
     def node_url(self, node_id: str) -> str:
-        return f"http://127.0.0.1:{self.node_ports[node_id]}"
+        port = self.extra.get(node_id) or self.node_ports[node_id]
+        return f"http://127.0.0.1:{port}"
+
+    @property
+    def metadata_path(self) -> str:
+        return os.path.join(self.base_dir, "controller", "metadata.json")
 
     def node_dir(self, node_id: str) -> str:
         return os.path.join(self.base_dir, node_id)
@@ -113,8 +145,13 @@ class Cluster:
         return p is not None and p.poll() is None
 
     def is_alive(self, node_id: str) -> bool:
-        """The controller's own view (from heartbeats)."""
-        return self.distributor._cached_state(self.distributor._get_node(node_id))[0]
+        """The controller's own view (from heartbeats). False for a worker that
+        has not registered yet."""
+        try:
+            node = self.distributor._get_node(node_id)
+        except KeyError:
+            return False
+        return self.distributor._cached_state(node)[0]
 
     # --- failure injection -------------------------------------------------
     def kill(self, node_id: str) -> None:
@@ -170,7 +207,8 @@ class Cluster:
 
     # --- back to a clean state ---------------------------------------------
     def reset(self) -> None:
-        """Every node running and alive, no objects, no chunk files."""
+        """Every node running and alive, no objects, no chunk files, no extra workers."""
+        self._remove_extras()
         for n in NODE_IDS:
             self.restart(n)
         self.wait_all_alive()
@@ -187,9 +225,17 @@ class Cluster:
                         p = os.path.join(sub, f)
                         if os.path.isfile(p):
                             os.remove(p)
-        with self.distributor._lock:
-            self.distributor.metadata.clear()
-            self.distributor.paths.clear()
+        d = self.distributor
+        with d._lock:
+            d.metadata.clear()
+            d.paths.clear()
+            d._save()
+        # placement and auto-repair start from scratch, so every test sees the same behaviour
+        d._pair_use.clear()
+        d._rotation = 0
+        d._down_since.clear()
+        d._repaired_for.clear()
+        d.last_auto_repair = None
         # make sure every node's heartbeat table entry is fresh and alive
         self.wait_all_alive()
 

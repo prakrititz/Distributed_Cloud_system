@@ -100,12 +100,12 @@ class TestUpload:
         assert upload_ok(cluster, "..\\..\\evil/../name.txt", b"x")["name"] == "name.txt"
 
     def test_when_the_nodes_cannot_hold_the_object_it_is_503_and_nothing_is_left(self, cluster):
-        for n in ("Node2", "Node3", "Node4"):
+        for n in ("worker2", "worker3", "worker4"):
             cluster.kill(n)
             assert cluster.wait_down(n)
         r = upload(cluster, "f", os.urandom(2 * MB))
         assert r.status_code == 503 and "error" in r.json()
-        assert cluster.chunk_files("Node1") == [] and listing(cluster) == []
+        assert cluster.chunk_files("worker1") == [] and listing(cluster) == []
 
 
 class TestDownload:
@@ -154,7 +154,7 @@ class TestMetadataEndpoints:
     def test_patch_updates_modified_at_but_not_created_at_chunks_or_data(self, cluster):
         data = os.urandom(MB + 5)
         m = upload_ok(cluster, "f", data)
-        files_before = {n: cluster.chunk_files(n) for n in ("Node1", "Node2", "Node3", "Node4")}
+        files_before = {n: cluster.chunk_files(n) for n in ("worker1", "worker2", "worker3", "worker4")}
         time.sleep(1.1)                                   # timestamps have one-second resolution
         u = requests.patch(f"{cluster.api}/objects/{m['object_id']}/metadata", json={"a": "b"}, timeout=TIMEOUT).json()
         assert u["modified_at"] > m["modified_at"] and u["created_at"] == m["created_at"]
@@ -244,7 +244,7 @@ class TestErrorsAreJson:
 class TestDebugEndpoints:
     def test_nodes_lists_all_four_with_heartbeat_ages(self, cluster):
         nodes = requests.get(cluster.api + "/nodes", timeout=TIMEOUT).json()
-        assert sorted(n["node"] for n in nodes) == ["Node1", "Node2", "Node3", "Node4"]
+        assert sorted(n["node"] for n in nodes) == ["worker1", "worker2", "worker3", "worker4"]
         assert all(n["alive"] and n["capacity"] == cluster.capacity and n["heartbeat_age"] is not None for n in nodes)
 
     def test_replication_report_summarises_every_chunk(self, cluster):

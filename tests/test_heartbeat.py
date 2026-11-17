@@ -9,7 +9,7 @@ from controller.distributor import Distributor
 from tests.cluster import HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, NODE_IDS, wait_until
 from tests.util import MB, TIMEOUT, download, post_heartbeat, replicas_of, upload, upload_ok
 
-GOOD = {"worker_id": "Node1", "capacity": 100, "used": 10, "free": 90, "chunks": 1}
+GOOD = {"worker_id": "worker1", "capacity": 100, "used": 10, "free": 90, "chunks": 1}
 
 
 class TestHeartbeatEndpoint:
@@ -71,26 +71,26 @@ class TestPlacementUsesTheCache:
 class TestFailureDetection:
     def test_a_dead_node_is_declared_down_after_the_timeout_and_not_before(self, cluster):
         started = time.time()
-        cluster.kill("Node2")
-        assert cluster.is_alive("Node2") or time.time() - started > HEARTBEAT_TIMEOUT   # not instantly
-        assert cluster.wait_down("Node2")
+        cluster.kill("worker2")
+        assert cluster.is_alive("worker2") or time.time() - started > HEARTBEAT_TIMEOUT   # not instantly
+        assert cluster.wait_down("worker2")
         assert time.time() - started <= HEARTBEAT_TIMEOUT + 4
-        assert all(cluster.is_alive(n) for n in NODE_IDS if n != "Node2")
+        assert all(cluster.is_alive(n) for n in NODE_IDS if n != "worker2")
 
     def test_the_nodes_endpoint_shows_it(self, cluster):
-        cluster.kill("Node3")
-        cluster.wait_down("Node3")
+        cluster.kill("worker3")
+        cluster.wait_down("worker3")
         nodes = {n["node"]: n for n in requests.get(cluster.api + "/nodes", timeout=TIMEOUT).json()}
-        assert nodes["Node3"]["alive"] is False and nodes["Node1"]["alive"] is True
+        assert nodes["worker3"]["alive"] is False and nodes["worker1"]["alive"] is True
 
     def test_uploads_during_the_failure_are_fast_and_avoid_the_dead_node(self, cluster):
-        cluster.kill("Node2")
-        assert cluster.wait_down("Node2")
+        cluster.kill("worker2")
+        assert cluster.wait_down("worker2")
         started = time.time()
         m = upload_ok(cluster, "f", os.urandom(6 * MB))
         elapsed = time.time() - started
         assert elapsed < 8                                   # no probe timeout per chunk
-        assert "Node2" not in {r for _, reps in replicas_of(cluster, m["object_id"]) for r in reps}
+        assert "worker2" not in {r for _, reps in replicas_of(cluster, m["object_id"]) for r in reps}
 
     def test_downloads_during_the_failure_work_and_are_fast(self, cluster):
         data = os.urandom(4 * MB)
@@ -104,7 +104,7 @@ class TestFailureDetection:
 
     def test_a_node_that_dies_just_before_it_is_declared_down_does_not_fail_the_upload(self, cluster):
         cluster.distributor.heartbeat_timeout = 60           # pretend the silence has not been noticed yet
-        victim = "Node1"
+        victim = "worker1"
         cluster.kill(victim)
         assert cluster.is_alive(victim)                       # the cache still believes it is alive
         m = upload_ok(cluster, "f", os.urandom(3 * MB))       # a copy is attempted on it, fails, is skipped
@@ -112,20 +112,20 @@ class TestFailureDetection:
         assert not cluster.is_alive(victim)                   # found out by the failed write
 
     def test_a_restarted_node_is_alive_again_and_used(self, cluster):
-        cluster.kill("Node4")
-        assert cluster.wait_down("Node4")
-        cluster.restart("Node4")
-        assert cluster.wait_alive("Node4")
+        cluster.kill("worker4")
+        assert cluster.wait_down("worker4")
+        cluster.restart("worker4")
+        assert cluster.wait_alive("worker4")
         used = set()
         for i in range(6):
             used |= {r for _, reps in replicas_of(cluster, upload_ok(cluster, f"f{i}", os.urandom(2 * MB))["object_id"])
                      for r in reps}
-        assert "Node4" in used
+        assert "worker4" in used
 
     def test_with_too_few_nodes_left_it_is_a_clean_503_not_a_hang(self, cluster):
-        for n in ("Node1", "Node2", "Node3"):
+        for n in ("worker1", "worker2", "worker3"):
             cluster.kill(n)
-        for n in ("Node1", "Node2", "Node3"):
+        for n in ("worker1", "worker2", "worker3"):
             assert cluster.wait_down(n)
         started = time.time()
         r = upload(cluster, "f", os.urandom(MB))

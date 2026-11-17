@@ -4,7 +4,7 @@ import requests
 from helpers.checksum import compute
 from tests.util import TIMEOUT
 
-NODE = "Node1"
+NODE = "worker1"
 
 
 def put(cluster, chunk_id, data, checksum="auto"):

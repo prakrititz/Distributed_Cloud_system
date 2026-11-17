@@ -1,21 +1,33 @@
-"""Settings shared by the distributor side: where the nodes are.
+"""Settings of the controller (and the defaults the workers share).
 
-This dict is the node registry for now. Later, nodes could register
-themselves (POST /internal/workers/register) instead.
+Where do the workers come from? They REGISTER themselves: every worker calls
+POST /internal/workers/register when it starts, with its id and address, so
+the controller needs no list and any number of workers can join. (In Docker
+the number is set in docker-compose.yml / .env.)
+
+WORKERS is an optional fixed list on top of that, for workers that are known
+in advance (the tests use it):
+    WORKERS=worker1=http://127.0.0.1:5001,worker2=http://127.0.0.1:5002
+Each id must be the NODE_ID that worker uses.
+
+Every setting can be given as an environment variable.
 """
 
 import os
 
-# node_id -> base URL of that node's server (see nodes/node_server.py)
-# TODO: adjust if you change ports, or read this from environment variables
-# Use 127.0.0.1, not "localhost": on Windows "localhost" tries IPv6 first and
-# waits about 2 seconds before falling back, which slowed every request.
-NODE_ADDRESSES = {
-    "Node1": "http://127.0.0.1:5001",
-    "Node2": "http://127.0.0.1:5002",
-    "Node3": "http://127.0.0.1:5003",
-    "Node4": "http://127.0.0.1:5004",
-}
+
+def _int_setting(name: str, default: int, minimum: int = 1) -> int:
+    """A whole-number setting from the environment, at least `minimum`."""
+    text = os.environ.get(name, "").strip()
+    if not text:
+        return default
+    try:
+        value = int(text)
+    except ValueError:
+        raise ValueError(f"{name} must be a whole number, got '{text}'") from None
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}, got {value}")
+    return value
 
 
 def parse_workers(text: str) -> dict:
@@ -36,26 +48,37 @@ def parse_workers(text: str) -> dict:
     return result
 
 
-# In Docker the workers are other containers, reached by their service name, so
-# the list comes from the environment instead of the dict above:
-#     WORKERS=worker1=http://worker1:5000,worker2=http://worker2:5000,...
-# Each id must be the NODE_ID that worker uses when it sends its heartbeats.
-if os.environ.get("WORKERS"):
-    NODE_ADDRESSES = parse_workers(os.environ["WORKERS"])
+# worker id -> base URL: workers known before any of them registers (optional).
+NODE_ADDRESSES = parse_workers(os.environ["WORKERS"]) if os.environ.get("WORKERS", "").strip() else {}
 
-# Heartbeats: every node tells the controller "I'm alive, this much space is
+# How objects are stored.
+CHUNK_SIZE = _int_setting("CHUNK_SIZE", 1024 * 1024)        # bytes per chunk (1 MB, as the spec says)
+REPLICATION_FACTOR = _int_setting("REPLICATION_FACTOR", 2)  # copies of every chunk, each on a different worker
+
+# Where the controller saves its metadata, so a restart keeps every object.
+# Empty ("") keeps it only in memory.
+METADATA_PATH = os.environ.get("METADATA_PATH", "./data/controller/metadata.json").strip()
+
+# Automatic repair: a worker that has been down this many seconds triggers a
+# repair (a quick restart within that time causes no copying). 0 turns it off.
+AUTO_REPAIR_GRACE = _int_setting("AUTO_REPAIR_GRACE", 30, minimum=0)
+# Orphan cleanup leaves alone chunks younger than this (seconds), so it can
+# never remove a chunk of an upload that is still running.
+ORPHAN_MIN_AGE = _int_setting("ORPHAN_MIN_AGE", 60, minimum=0)
+
+# Heartbeats: every worker tells the controller "I'm alive, this much space is
 # free" every HEARTBEAT_INTERVAL seconds. The controller keeps the latest
-# report per node and treats a node that has not reported for HEARTBEAT_TIMEOUT
+# report per worker and treats one that has not reported for HEARTBEAT_TIMEOUT
 # seconds as down (3 missed beats), so placing a chunk needs no requests.
 HEARTBEAT_INTERVAL = 2
 HEARTBEAT_TIMEOUT = 6
-# Where the node servers send their heartbeats (the Flask API in app.py).
+# Where the workers register and send their heartbeats (the Flask API in app.py).
 CONTROLLER_URL = "http://127.0.0.1:5000"
 
-# Seconds to wait for a node before treating it as down.
+# Seconds to wait for a worker before treating it as down.
 # Two separate limits: how long to wait for a connection (short, so a dead
-# node is given up on quickly) and how long to wait for an answer once
-# connected (longer, so a slow disk write on a live node isn't mistaken for a
+# worker is given up on quickly) and how long to wait for an answer once
+# connected (longer, so a slow disk write on a live worker isn't mistaken for a
 # failure).
 CONNECT_TIMEOUT = 0.5
 READ_TIMEOUT = 5

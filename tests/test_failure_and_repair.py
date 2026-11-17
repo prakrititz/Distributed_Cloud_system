@@ -72,15 +72,15 @@ class TestWorkerFailure:
     def test_two_workers_down_one_copy_left_is_still_served_and_repaired_as_far_as_possible(self, cluster):
         data = os.urandom(3 * MB)
         oid = upload_ok(cluster, "f", data)["object_id"]
-        cluster.kill("Node1")
-        assert cluster.wait_down("Node1")
+        cluster.kill("worker1")
+        assert cluster.wait_down("worker1")
         repair(cluster)
-        cluster.kill("Node2")
-        assert cluster.wait_down("Node2")
+        cluster.kill("worker2")
+        assert cluster.wait_down("worker2")
         assert download(cluster, oid).content == data               # every chunk was back to two copies first
         result = repair(cluster)
         assert result["unrecoverable"] == 0
-        every_chunk_on_two_distinct_live_nodes(cluster, oid, dead=["Node1", "Node2"])
+        every_chunk_on_two_distinct_live_nodes(cluster, oid, dead=["worker1", "worker2"])
 
 
 class TestCorruptionRepair:

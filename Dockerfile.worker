@@ -1,8 +1,9 @@
 # The WORKER image: nodes/ + helpers/ + config.py.
-# The SAME image is started four times (worker1..worker4), each with its own
-# NODE_ID and its own volume.
+# The SAME image is started as many times as docker-compose.yml says
+# (WORKERS in .env). Every copy finds its own id (worker1, worker2, ...) from
+# the number Docker gives its container, and registers with the controller.
 #
-# Build from the project's top folder:
+# Build from the project's top folder (docker compose does this for you):
 #     docker build -f Dockerfile.worker -t object-store-worker .
 #
 # Which files go in is decided by Dockerfile.worker.dockerignore.
@@ -23,17 +24,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Settings. node_server.py reads all of these from the environment:
-#   NODE_ID             MUST be set differently for each container (worker1 ..
-#                       worker4). It is also the id the controller lists in WORKERS.
+#   NODE_ID             "auto": container object-store-worker-2 becomes worker2
+#                       (set a fixed id instead to run a single container by hand)
 #   HOST                0.0.0.0, otherwise other containers cannot reach it
 #   PORT                the port it listens on
-#   CAPACITY            bytes it may store (default: 5 MB)
-#   DATA_DIR            where the chunks live; this is the volume below
-#   CONTROLLER_URL      where heartbeats are sent
+#   CAPACITY            bytes it may store (default: 5 MB; compose sets it)
+#   DATA_DIR            where the chunks live: its own folder in the volume
+#                       below ({node_id} is replaced by the id, e.g. /data/worker2)
+#   CONTROLLER_URL      where it registers and sends heartbeats
 #   HEARTBEAT_INTERVAL  seconds between heartbeats
 ENV HOST=0.0.0.0 \
     PORT=5000 \
-    DATA_DIR=/data \
+    NODE_ID=auto \
+    DATA_DIR=/data/{node_id} \
     CONTROLLER_URL=http://controller:5000
 
 # Non-root user, and a /data folder it owns BEFORE it is declared a volume, so a
@@ -44,8 +47,9 @@ RUN useradd --create-home --uid 10001 app \
 USER app
 
 # PERSISTENT STORAGE (required by the spec): the chunks live in /data, so they
-# survive `docker stop` / `docker start` and rebuilding the image. In
-# docker-compose give each worker its OWN named volume mounted at /data.
+# survive `docker stop` / `docker start`, re-creating the container and
+# rebuilding the image. docker-compose.yml mounts one named volume here for all
+# workers; each worker only uses its own folder in it (/data/worker1, ...).
 VOLUME ["/data"]
 
 EXPOSE 5000
