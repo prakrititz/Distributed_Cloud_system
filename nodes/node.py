@@ -137,6 +137,22 @@ class ChunkStore:
         """Number of stored chunks."""
         return sum(1 for _ in self._chunk_files())
 
+    def list_chunks(self) -> list:
+        """Every stored chunk: [{chunk_id, size, age}], age = seconds since it
+        was last written. The controller compares this with its metadata to
+        find chunks no object points to (orphans); the age lets it leave alone
+        a chunk that was written a moment ago by an upload still in progress."""
+        now = time.time()
+        result = []
+        for entry in self._chunk_files():
+            try:
+                st = entry.stat()
+            except FileNotFoundError:      # deleted while we looked
+                continue
+            result.append({"chunk_id": entry.name, "size": st.st_size,
+                           "age": round(max(0.0, now - st.st_mtime), 1)})
+        return sorted(result, key=lambda c: c["chunk_id"])
+
     def store(self, chunk_id: str, data: bytes) -> bool:
         """Write the chunk file and its checksum. Returns False if it doesn't
         fit. Storing an id that already exists replaces it; only the size

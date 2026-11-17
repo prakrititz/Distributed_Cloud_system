@@ -147,6 +147,14 @@ class RemoteNode:
             raise ValueError(response.json().get("error", "invalid chunk id"))
         raise self._unexpected(response)
 
+    def list_chunks(self) -> list:
+        """GET /internal/chunks -> [{chunk_id, size, age}] of every chunk the
+        node holds. Raises NodeUnavailable if it can't be reached."""
+        response = self._request("GET", "/internal/chunks")
+        if response.status_code != 200:
+            raise self._unexpected(response)
+        return response.json()["chunks"]
+
     def has_chunk(self, chunk_id: str) -> bool:
         """True only if the node is up AND holds the chunk (HEAD request, so no
         data is transferred). Used by the replication health report."""

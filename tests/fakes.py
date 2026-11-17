@@ -19,6 +19,7 @@ class FakeNode:
         self.on_store = None      # optional callback(chunk_id), called after a successful store
         self.health_calls = 0
         self.store_calls = []     # chunk ids we were asked to store (even if refused)
+        self.ages = {}            # chunk_id -> age reported by list_chunks (default: old)
 
     # --- helpers for tests -------------------------------------------------
     def used(self) -> int:
@@ -81,6 +82,11 @@ class FakeNode:
         actual = compute(self.chunks[chunk_id])
         stored = self.sums.get(chunk_id)
         return {"chunk_id": chunk_id, "checksum": actual, "stored": stored, "ok": actual == stored}
+
+    def list_chunks(self) -> list:
+        self._up()
+        return [{"chunk_id": c, "size": len(d), "age": self.ages.get(c, 1000.0)}
+                for c, d in sorted(self.chunks.items())]
 
     def has_chunk(self, chunk_id: str) -> bool:
         return (not self.down) and chunk_id in self.chunks
