@@ -13,6 +13,20 @@ orphan cleanup, persistent metadata, and a Docker Compose deployment.
 
 **To run it and try everything yourself, see [GUIDE.md](GUIDE.md).**
 
+![On Store, the terminal dashboard](docs/demo.gif)
+
+**On Store**, a live terminal dashboard, shows every worker, every chunk and
+where its copies are, heartbeats, failures and repairs. Its keys also kill and
+start workers, upload, corrupt a copy and repair:
+
+```
+pip install -r dashboard/requirements.txt
+docker compose up --build -d
+python -m dashboard
+```
+
+See [dashboard/README.md](dashboard/README.md) for its screens and keys.
+
 ## Architecture
 
 ```
@@ -215,6 +229,7 @@ python -m pytest tests -m "not cluster"   # only the fast tests that start no se
 | `test_client.py` | the client: menu, commands, original bytes on download |
 | `test_registration.py` | workers registering and re-registering, more workers joining, finding the id in Docker |
 | `test_docker_files.py` | each image's allowlist starts its program, the settings work, the compose file and Dockerfiles say what the spec requires |
+| `test_dashboard.py` | the dashboard: worker states, chunk health, events, heartbeat detection; the real app driven by keyboard against the cluster |
 
 The slower tests start four real worker processes and the API on free local
 ports and stop them afterwards.
