@@ -1,0 +1,35 @@
+# The CLIENT image: client.py + helpers/. Started on demand, one container per
+# client (client1, client2 in docker-compose.yml), each with its own CLIENT_ID.
+#
+#   docker compose run --rm client1                       the menu
+#   docker compose run --rm client1 upload /files/a.txt   one command
+#   docker compose run --rm client1 list
+#
+# Which files go in is decided by Dockerfile.client.dockerignore.
+
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+
+# Settings:
+#   API_URL    the controller, by its name on the compose network
+#   CLIENT_ID  who this client is (set per client in docker-compose.yml). It
+#              must stay the same between runs, and a container's own hostname
+#              changes every time, so it is always set explicitly.
+ENV API_URL=http://controller:5000/api/v1
+
+# Files to upload are mounted at /files; downloads are saved in /downloads
+# (the working folder), which is a folder on this machine too.
+RUN useradd --create-home --uid 10001 app \
+    && mkdir /downloads \
+    && chown app:app /downloads
+USER app
+WORKDIR /downloads
+
+ENTRYPOINT ["python", "/app/client.py"]

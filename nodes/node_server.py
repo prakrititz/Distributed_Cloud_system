@@ -2,23 +2,32 @@
 
 Start one per node, each with its own port and data folder, e.g.
 
-    NODE_ID=Node1 PORT=5001 DATA_DIR=./data/Node1 python -m nodes.node_server
-    NODE_ID=Node2 PORT=5002 DATA_DIR=./data/Node2 python -m nodes.node_server
+    NODE_ID=worker1 PORT=5001 python -m nodes.node_server
+    NODE_ID=worker2 PORT=5002 python -m nodes.node_server
     ...
 
-(PowerShell: $env:NODE_ID="Node1"; $env:PORT="5001"; python -m nodes.node_server)
+(PowerShell: $env:NODE_ID="worker1"; $env:PORT="5001"; python -m nodes.node_server)
 
 Run these from the project's top folder (the one with app.py), so that the
-helpers/ and nodes/ packages can be found.
+helpers/ and nodes/ packages can be found. Start as many as you like, in any
+order: each one registers itself with the controller.
 
-Settings (environment variables): NODE_ID, PORT, CAPACITY (bytes), DATA_DIR,
-HOST (use 0.0.0.0 inside a container so other containers can reach it),
-CONTROLLER_URL (where to send heartbeats, default http://127.0.0.1:5000) and
-HEARTBEAT_INTERVAL (seconds, default 2).
+Settings (environment variables):
+  NODE_ID             this worker's id. "auto" (used in Docker) means: take the
+                      number Docker Compose gave the container, so replica 2
+                      becomes worker2 (see nodes/identity.py)
+  WORKER_NAME         the prefix for "auto" ids (default "worker")
+  PORT, HOST          where it listens (HOST=0.0.0.0 inside a container)
+  CAPACITY            bytes it may store (default 5 MB)
+  DATA_DIR            its chunk folder; "{node_id}" in it is replaced by the id,
+                      so many workers can share one volume (default ./data/{node_id})
+  ADVERTISE_URL       the address the controller should use to reach it
+                      (default: worked out from HOST/PORT, or the container name)
+  CONTROLLER_URL      where it registers and sends heartbeats
+  HEARTBEAT_INTERVAL  seconds between heartbeats (default 2)
 
-Later each of these becomes one Docker container built from the same image.
-The distributor talks to it only through the endpoints below, never by
-importing it. Nodes never talk to each other.
+The controller talks to it only through the endpoints below, never by
+importing it. Workers never talk to each other.
 """
 import os
 import threading
@@ -31,17 +40,28 @@ from config import HEARTBEAT_INTERVAL as DEFAULT_HEARTBEAT_INTERVAL
 from config import CONTROLLER_URL as DEFAULT_CONTROLLER_URL
 from helpers.checksum import compute, verify
 from helpers.errors import ChunkCorrupt
+from nodes import identity
 from nodes.node import ChunkStore
 
 app = Flask(__name__)
 
-NODE_ID = os.environ.get("NODE_ID", "Node1")
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "5001"))
 CAPACITY = int(os.environ.get("CAPACITY", 5 * 1024 * 1024))   # bytes
-DATA_DIR = os.environ.get("DATA_DIR", f"./data/{NODE_ID}")
 CONTROLLER_URL = os.environ.get("CONTROLLER_URL", DEFAULT_CONTROLLER_URL)
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", DEFAULT_HEARTBEAT_INTERVAL))
+
+
+# Who am I, and where can the controller reach me? (see nodes/identity.py)
+_requested_id = os.environ.get("NODE_ID", "worker1").strip() or "worker1"
+NODE_ID, ADVERTISE_URL = identity.choose_identity(
+    _requested_id, HOST, PORT,
+    advertise_url=os.environ.get("ADVERTISE_URL", "").strip() or None,
+    name_prefix=os.environ.get("WORKER_NAME", "worker").strip() or "worker",
+    # only look the container up when asked to (it is a DNS query)
+    container_name=identity.docker_container_name() if _requested_id == "auto" else None,
+)
+DATA_DIR = os.environ.get("DATA_DIR", "./data/{node_id}").replace("{node_id}", NODE_ID)
 
 store = ChunkStore(DATA_DIR, CAPACITY)
 
@@ -143,6 +163,14 @@ def delete_chunk(chunk_id):
     return "", 204
 
 
+@app.route("/internal/chunks", methods=["GET"])
+def list_chunks():
+    """Every chunk this worker holds: {node_id, chunks: [{chunk_id, size, age}]}
+    (age in seconds since the chunk was written). Used by the controller to
+    find orphaned and missing chunks."""
+    return jsonify({"node_id": NODE_ID, "chunks": store.list_chunks()})
+
+
 @app.route("/internal/health", methods=["GET"])
 def health():
     """Tell the distributor this node is alive and how much space it has."""
@@ -155,32 +183,56 @@ def health():
     })
 
 
+def space_report() -> dict:
+    """What this worker tells the controller about itself."""
+    return {
+        "worker_id": NODE_ID,
+        "capacity": store.capacity,
+        "used": store.used_space(),
+        "free": store.free_space(),
+        "chunks": store.chunk_count(),
+    }
+
+
 def send_heartbeats() -> None:
-    """Runs forever in a background thread: every HEARTBEAT_INTERVAL seconds
-    tell the controller this node is alive and how much space it has. If the
-    controller cannot be reached, just try again next round (it may not be
-    started yet, or may be restarting)."""
-    url = CONTROLLER_URL.rstrip("/") + "/internal/workers/heartbeat"
-    connected = None   # only to print when the connection state changes
+    """Runs forever in a background thread.
+
+    First REGISTER (POST /internal/workers/register with this worker's id and
+    address), so the controller knows it exists. Then every
+    HEARTBEAT_INTERVAL seconds send a heartbeat (alive + free space).
+
+    If the controller cannot be reached, try again next round (it may not be
+    started yet, or may be restarting). If it answers a heartbeat with 404 it
+    has forgotten this worker (it restarted), so register again."""
+    base = CONTROLLER_URL.rstrip("/")
+    registered = False
+    connected = None   # only to print when the state changes
     while True:
         try:
-            response = requests.post(url, json={
-                "worker_id": NODE_ID,
-                "capacity": store.capacity,
-                "used": store.used_space(),
-                "free": store.free_space(),
-                "chunks": store.chunk_count(),
-            }, timeout=(0.5, 2))
-            now_connected = response.status_code == 200
+            if not registered:
+                response = requests.post(base + "/internal/workers/register",
+                                         json={**space_report(), "url": ADVERTISE_URL}, timeout=(0.5, 2))
+                registered = response.status_code in (200, 201)
+                now_connected = registered
+                if registered:
+                    print(f"[{NODE_ID}] registered with {base} as {ADVERTISE_URL}")
+            else:
+                response = requests.post(base + "/internal/workers/heartbeat", json=space_report(), timeout=(0.5, 2))
+                if response.status_code == 404:          # the controller does not know us (any more)
+                    registered = False
+                    print(f"[{NODE_ID}] the controller does not know this worker; registering again")
+                    continue
+                now_connected = response.status_code == 200
         except requests.RequestException:
             now_connected = False
         if now_connected != connected:
             connected = now_connected
-            print(f"[{NODE_ID}] heartbeats to {url}: " + ("accepted" if connected else "not getting through"))
+            print(f"[{NODE_ID}] controller {base}: " + ("connected" if connected else "not reachable, retrying"))
         time.sleep(HEARTBEAT_INTERVAL)
 
 
 if __name__ == "__main__":
-    print(f"[{NODE_ID}] listening on {HOST}:{PORT}, data in {DATA_DIR}, capacity {CAPACITY} bytes")
+    print(f"[{NODE_ID}] listening on {HOST}:{PORT} (reachable as {ADVERTISE_URL}), "
+          f"data in {DATA_DIR}, capacity {CAPACITY} bytes")
     threading.Thread(target=send_heartbeats, daemon=True).start()
     app.run(host=HOST, port=PORT)

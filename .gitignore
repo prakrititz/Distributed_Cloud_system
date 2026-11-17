@@ -30,3 +30,6 @@ Thumbs.db
 storage/
 downloads/
 data/
+
+# downloads saved by the client containers
+downloads/

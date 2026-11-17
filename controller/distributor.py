@@ -10,7 +10,11 @@ The distributor writes each copy itself.
 
 Objects are identified by an object_id the distributor generates. The file
 name is only metadata and is not unique; what makes an upload a duplicate is
-its source_path (where the client read the file from).
+its source_path (where the client read the file from) together with the
+client_id of the client that sent it: the same path from the same client is the
+same file, while two different clients may use the same path string.
+
+Workers join by registering (register_node), so their number is not fixed.
 
 The nodes it is given are RemoteNode objects (controller/remote_node.py): every call on
 them is an HTTP request to that node's server. The distributor only relies on
@@ -21,10 +25,12 @@ delete_chunk().
 import threading
 import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from config import HEARTBEAT_TIMEOUT
+from controller.metadata_store import MemoryStore
 from helpers.checksum import compute, verify
 from helpers.errors import ChunkCorrupt, NodeUnavailable
 
@@ -63,14 +69,46 @@ class ObjectMetadata:
     created_at: str = ""
     modified_at: str = ""                       # changes when custom metadata is patched
     custom: dict = field(default_factory=dict)  # user-defined key-value metadata
-    source_path: str = ""                       # where the client read the file; unique
+    source_path: str = ""                       # where the client read the file
+    client_id: str = ""                         # which client sent it; (client_id, source_path) is unique
+
+    @staticmethod
+    def from_dict(d: dict) -> "ObjectMetadata":
+        """Rebuild from what the metadata store saved."""
+        d = dict(d)
+        d["chunks"] = [ChunkInfo(**c) for c in d.get("chunks", [])]
+        return ObjectMetadata(**d)
+
+
+class _UnregisteredNode:
+    """Stands in for a worker that the metadata mentions but that has not
+    registered (yet), for example right after the controller restarted. It
+    behaves like a worker that is down, so downloads use the other copy and
+    repair treats it as unreachable."""
+
+    def __init__(self, node_id: str):
+        self.node_id = node_id
+
+    def _down(self, *args, **kwargs):
+        raise NodeUnavailable(f"{self.node_id} has not registered")
+
+    health = store_chunk = get_chunk = get_checksum = delete_chunk = list_chunks = _down
+    alive = False
+
+    def has_chunk(self, chunk_id: str) -> bool:
+        return False
 
 
 class Distributor:
     def __init__(self, nodes: list, chunk_size: int = CHUNK_SIZE,
                  replication_factor: int = REPLICATION_FACTOR,
-                 heartbeat_timeout: float = HEARTBEAT_TIMEOUT):
-        self.nodes = nodes             # list of RemoteNode (the node registry, for now)
+                 heartbeat_timeout: float = HEARTBEAT_TIMEOUT, store=None):
+        # The node registry: a list of RemoteNode. Workers are added while the
+        # system runs (register_node), so the list is never changed in place:
+        # a new list replaces it, and a request already looping over the old
+        # one is not disturbed.
+        self.nodes = list(nodes)
+        self._nodes_lock = threading.Lock()
         self.heartbeat_timeout = heartbeat_timeout
         # What the nodes last told us, so placing a chunk needs no requests:
         # node_id -> {capacity, used, free, chunks, last_seen}. last_seen is a
@@ -80,12 +118,55 @@ class Distributor:
         self.chunk_size = chunk_size   # a parameter so we can test with tiny chunks
         self.replication_factor = replication_factor
         self.metadata = {}             # object_id -> ObjectMetadata
-        self.paths = {}                # source_path -> object_id (duplicate check)
+        self.paths = {}                # (client_id, source_path) -> object_id (duplicate check)
         # The web server handles requests on several threads. This lock makes
         # "check the path is free, then register the object" one step, and
         # protects changes to an object's metadata.
         self._lock = threading.Lock()
-        self._repair_lock = threading.Lock()   # only one repair at a time
+        self._repair_lock = threading.Lock()   # only one repair (or cleanup) at a time
+
+        # Persistence: the metadata is saved after every change and loaded here.
+        self.store = store or MemoryStore()
+        for d in self.store.load():
+            meta = ObjectMetadata.from_dict(d)
+            self.metadata[meta.object_id] = meta
+            if meta.source_path:
+                self.paths[(meta.client_id, meta.source_path)] = meta.object_id
+        if self.metadata:
+            print(f"[metadata] loaded {len(self.metadata)} object(s)")
+
+        # Placement spreads copies over many different PAIRS of workers (see
+        # _pick_nodes): how often each pair already holds a chunk together,
+        # and a counter that rotates which worker wins a tie.
+        self._pair_use = Counter()
+        self._rotation = 0
+        for meta in self.metadata.values():
+            for info in meta.chunks:
+                self._note_copies(info.replicas)
+
+        # Object ids whose upload is still storing chunks. Their chunks are on
+        # the workers but not in the metadata yet: cleanup must not touch them.
+        self._in_flight = set()
+
+        # Automatic repair (auto_repair_check): when each worker was first
+        # seen down, and the workers already repaired for.
+        self._down_since = {}
+        self._repaired_for = set()
+        self.last_auto_repair = None
+
+    # ------------------------------------------------------------------
+    # persistence
+    # ------------------------------------------------------------------
+    def _save(self) -> None:
+        """Save all metadata. Call with self._lock held, right after a change,
+        so saves happen in the same order as the changes."""
+        self.store.save(list(self.metadata.values()))
+
+    @property
+    def persistent(self) -> bool:
+        """True if the metadata is saved, i.e. it survives a restart, so it is
+        the full truth about what should be on the workers."""
+        return self.store.persistent
 
     # ------------------------------------------------------------------
     # helpers
@@ -108,6 +189,20 @@ class Distributor:
         with self._status_lock:
             self._status[node_id] = {"capacity": capacity, "used": used, "free": free,
                                      "chunks": chunks, "last_seen": time.monotonic()}
+
+    def register_node(self, node, capacity: int, used: int, free: int, chunks: int) -> bool:
+        """A worker announces itself (it has just started). Adds it to the
+        registry, or, if a worker with this id is already known (a restart),
+        replaces the old entry, because its address may have changed. Its
+        report counts as a heartbeat, so it is alive at once. Returns True if
+        the worker is new."""
+        with self._nodes_lock:
+            others = [n for n in self.nodes if n.node_id != node.node_id]
+            is_new = len(others) == len(self.nodes)
+            self.nodes = others + [node] if is_new else \
+                [node if n.node_id == node.node_id else n for n in self.nodes]   # keep its place
+        self.record_heartbeat(node.node_id, capacity, used, free, chunks)
+        return is_new
 
     def _mark_down(self, node_id: str) -> None:
         """A request to this node just failed: treat it as down at once, rather
@@ -143,6 +238,17 @@ class Distributor:
         alive = seen is not None and time.monotonic() - seen <= self.heartbeat_timeout
         return alive, entry["free"]
 
+    def counts_as_down(self, node_id: str) -> bool:
+        """True if the controller already counts this node as down (no
+        heartbeat for heartbeat_timeout, or a request to it just failed),
+        without asking it. A node never heard of is not counted down."""
+        with self._status_lock:
+            entry = self._status.get(node_id)
+        if entry is None:
+            return False
+        seen = entry["last_seen"]
+        return seen is None or time.monotonic() - seen > self.heartbeat_timeout
+
     def heartbeat_age(self, node_id: str):
         """Seconds since the node last reported, or None if it never has."""
         with self._status_lock:
@@ -151,36 +257,63 @@ class Distributor:
             return None
         return round(time.monotonic() - entry["last_seen"], 1)
 
-    def _pick_nodes(self, chunk_size: int, count: int, exclude=()):
-        """Choose `count` DIFFERENT live nodes that can fit this chunk, most
-        free space first (ties keep node-list order). Returns the list, or
-        None if fewer than `count` nodes qualify. Nodes whose id is in
-        `exclude` are never chosen (repair uses this to avoid nodes that
-        already hold a copy).
+    def _pick_nodes(self, chunk_size: int, count: int, exclude=(), partners=()):
+        """Choose `count` DIFFERENT live nodes that can fit this chunk. Returns
+        the list, or None if fewer than `count` nodes qualify. Nodes whose id
+        is in `exclude` are never chosen.
+
+        Order of preference:
+          1. the node that has shared the fewest chunks with `partners` (the
+             nodes already holding a copy of THIS chunk), so the copies of
+             different chunks land on many different pairs of workers. With
+             fixed pairs, losing both workers of one pair would lose all their
+             chunks; spread out, losing any two workers loses few chunks.
+          2. most free space
+          3. a rotating start, so equal nodes take turns.
+        A node without room for the chunk is never chosen.
 
         Decides from what the nodes last reported (heartbeats), so it sends no
         requests. The picture can be a moment old: if a chosen node turns out
         to be dead or full, the caller sees the failed write and picks
         another."""
-        candidates = []   # (free_space, node)
-        for node in self.nodes:
+        nodes = self.nodes
+        start = self._rotation % len(nodes) if nodes else 0
+        candidates = []   # (shared_with_partners, -free_space, turn, node)
+        for i, node in enumerate(nodes):
             if node.node_id in exclude:
                 continue
             alive, free = self._cached_state(node)
             if alive and free >= chunk_size:
-                candidates.append((free, node))
+                shared = sum(self._pair_use[frozenset((node.node_id, p))] for p in partners)
+                candidates.append((shared, -free, (i - start) % len(nodes), node))
 
         if len(candidates) < count:
             return None
-        candidates.sort(key=lambda c: -c[0])   # stable: ties keep node-list order
-        return [node for _, node in candidates[:count]]
+        candidates.sort(key=lambda c: c[:3])
+        return [c[3] for c in candidates[:count]]
+
+    def _note_copies(self, node_ids) -> None:
+        """These nodes now hold copies of the same chunk: count each pair."""
+        ids = list(node_ids)
+        with self._status_lock:
+            for a in range(len(ids)):
+                for b in range(a + 1, len(ids)):
+                    self._pair_use[frozenset((ids[a], ids[b]))] += 1
 
     def _get_node(self, node_id: str):
-        """Find a node by its id."""
+        """Find a registered node by its id. Raises KeyError if unknown."""
         for node in self.nodes:
             if node.node_id == node_id:
                 return node
         raise KeyError(f"Unknown node: {node_id}")
+
+    def _node_for(self, node_id: str):
+        """The node with this id, or, if it has not registered (yet), a
+        stand-in that behaves like a node that is down."""
+        try:
+            return self._get_node(node_id)
+        except KeyError:
+            return _UnregisteredNode(node_id)
 
     def _rollback(self, written: list) -> None:
         """Delete every copy stored so far by a failed upload."""
@@ -192,15 +325,17 @@ class Distributor:
                       f"copy of {chunk_id} left behind")
 
     @staticmethod
-    def _duplicate_message(source_path: str, existing_id: str) -> str:
-        return (f"An object uploaded from '{source_path}' already exists "
+    def _duplicate_message(client_id: str, source_path: str, existing_id: str) -> str:
+        who = f"client '{client_id}'" if client_id else "this client"
+        return (f"An object uploaded by {who} from '{source_path}' already exists "
                 f"(object_id {existing_id}); delete it first to upload it again")
 
     # ------------------------------------------------------------------
     # upload / download
     # ------------------------------------------------------------------
     def upload(self, name: str, data: bytes, content_type: str = DEFAULT_CONTENT_TYPE,
-               custom: dict = None, source_path: str = None, size: int = None) -> str:
+               custom: dict = None, source_path: str = None, size: int = None,
+               client_id: str = None) -> str:
         """Split data, store every chunk on REPLICATION_FACTOR different
         nodes, record metadata. Return the new object_id.
 
@@ -208,8 +343,12 @@ class Distributor:
         content_type e.g. 'video/mp4'
         custom       user-defined key-value metadata
         source_path  where the client read the file from. Two uploads with the
-                     same source_path are the same file, so the second is
-                     refused. Optional: without it, nothing is checked.
+                     same source_path from the same client are the same file,
+                     so the second is refused. Optional: without it, nothing
+                     is checked.
+        client_id    which client is uploading. It scopes the duplicate check,
+                     so two clients can each upload their own '/files/a.txt'.
+                     Optional: uploads without it share one anonymous scope.
         size         size of the original object if it differs from len(data)
                      (e.g. the client wraps the file in a header); defaults to
                      len(data)
@@ -221,10 +360,14 @@ class Distributor:
         half-uploaded is left behind. (Strict: no chunk is ever stored with
         fewer copies than the replication factor.)
 
-        Raises FileExistsError if an object from this source_path exists.
+        Raises FileExistsError if this client already has an object from this
+        source_path.
         """
-        if source_path and source_path in self.paths:
-            raise FileExistsError(self._duplicate_message(source_path, self.paths[source_path]))
+        client_id = client_id or ""
+        path_key = (client_id, source_path)
+        if source_path and path_key in self.paths:
+            raise FileExistsError(
+                self._duplicate_message(client_id, source_path, self.paths[path_key]))
 
         object_id = str(uuid.uuid4())
         chunk_list = self._split(data)
@@ -247,9 +390,11 @@ class Distributor:
         #   it is simply thrown away.
         written = []
         placed = []
+        self._in_flight.add(object_id)
         try:
             for index, chunk in enumerate(chunk_list):
                 chunk_id = f"{object_id}-{index}"
+                self._rotation += 1        # equal nodes take turns, chunk by chunk
 
                 # Place the copies one at a time. Placement uses what the nodes
                 # last reported, which can be a moment old, so a chosen node may
@@ -259,8 +404,9 @@ class Distributor:
                 targets = []   # nodes that now hold a copy of this chunk
                 tried = set()  # nodes that failed for this chunk
                 while len(targets) < self.replication_factor:
-                    picked = self._pick_nodes(len(chunk), 1,
-                                              exclude=tried | {n.node_id for n in targets})
+                    holders = [n.node_id for n in targets]
+                    picked = self._pick_nodes(len(chunk), 1, exclude=tried | set(holders),
+                                              partners=holders)
                     if picked is None:
                         raise RuntimeError(
                             f"Not enough storage: need {self.replication_factor} different "
@@ -282,6 +428,7 @@ class Distributor:
                     targets.append(node)
 
                 replica_ids = [n.node_id for n in targets]
+                self._note_copies(replica_ids)
                 print(f"[upload] chunk {index} ({len(chunk)} bytes) -> {', '.join(replica_ids)}")
                 # all copies stored: record the chunk, with the checksum every
                 # copy must match when it is read back
@@ -291,9 +438,9 @@ class Distributor:
             # again: another upload of the same file may have finished while
             # this one was storing chunks.
             with self._lock:
-                if source_path and source_path in self.paths:
+                if source_path and path_key in self.paths:
                     raise FileExistsError(
-                        self._duplicate_message(source_path, self.paths[source_path]))
+                        self._duplicate_message(client_id, source_path, self.paths[path_key]))
                 now = _now()
                 self.metadata[object_id] = ObjectMetadata(
                     object_id=object_id,
@@ -306,15 +453,24 @@ class Distributor:
                     modified_at=now,
                     custom=dict(custom or {}),
                     source_path=source_path or "",
+                    client_id=client_id,
                 )
                 if source_path:
-                    self.paths[source_path] = object_id
+                    self.paths[path_key] = object_id
+                self._save()
         except Exception as e:
             # Whatever went wrong (no space, a node died, a bug), never leave
             # copies behind that no metadata points to.
             print(f"[upload] '{name}' failed ({e}); rolling back {len(written)} copy/copies")
+            with self._lock:
+                if self.metadata.get(object_id) is not None:   # registered, but the save failed
+                    meta = self.metadata.pop(object_id)
+                    if meta.source_path and self.paths.get(path_key) == object_id:
+                        del self.paths[path_key]
             self._rollback(written)
             raise
+        finally:
+            self._in_flight.discard(object_id)
 
         print(f"[upload] done, '{name}' -> object_id={object_id}")
         return object_id
@@ -347,9 +503,9 @@ class Distributor:
         problems = []   # (node_id, what was wrong), for the error message
         # Nodes known to be down (from heartbeats) go last, so they are not
         # waited for when another copy is available.
-        order = sorted(info.replicas, key=lambda n: not self._cached_state(self._get_node(n))[0])
+        order = sorted(info.replicas, key=lambda n: not self._cached_state(self._node_for(n))[0])
         for node_id in order:
-            node = self._get_node(node_id)
+            node = self._node_for(node_id)
             try:
                 data = node.get_chunk(info.chunk_id)
             except NodeUnavailable:
@@ -405,6 +561,7 @@ class Distributor:
                 else:
                     meta.custom[key] = value
             meta.modified_at = _now()
+            self._save()
             return meta
 
     def delete(self, object_id: str) -> list:
@@ -418,14 +575,16 @@ class Distributor:
         with self._lock:
             meta = self.get_object(object_id)
             del self.metadata[object_id]
-            if meta.source_path and self.paths.get(meta.source_path) == object_id:
-                del self.paths[meta.source_path]
+            path_key = (meta.client_id, meta.source_path)
+            if meta.source_path and self.paths.get(path_key) == object_id:
+                del self.paths[path_key]
+            self._save()
 
         left_behind = []
         for info in meta.chunks:
             for node_id in info.replicas:
                 try:
-                    self._get_node(node_id).delete_chunk(info.chunk_id)
+                    self._node_for(node_id).delete_chunk(info.chunk_id)
                 except NodeUnavailable:
                     left_behind.append((node_id, info.chunk_id))
 
@@ -436,16 +595,26 @@ class Distributor:
     # ------------------------------------------------------------------
     # health (read-only report) and repair
     # ------------------------------------------------------------------
-    def _check_copy(self, node_id: str, info: ChunkInfo) -> str:
+    def _check_copy(self, node_id: str, info: ChunkInfo, unreachable: set = None) -> str:
         """Judge one copy of a chunk without downloading it: ask the node to
         recompute the checksum of what is on its disk and compare it with the
         checksum the distributor recorded at upload.
 
         Returns 'ok', 'down' (node unreachable), 'missing' (node is up but
-        has no such chunk) or 'corrupt' (the bytes no longer match)."""
+        has no such chunk) or 'corrupt' (the bytes no longer match).
+
+        A node the controller already counts as down is not asked (asking a
+        dead container can take seconds: its name no longer resolves).
+        `unreachable`, if given, is the set of nodes that already failed in
+        this pass over the chunks; a node that fails is added to it, so a dead
+        node costs one failed request per pass, not one per copy."""
+        if (unreachable is not None and node_id in unreachable) or self.counts_as_down(node_id):
+            return "down"
         try:
-            actual = self._get_node(node_id).get_checksum(info.chunk_id)["checksum"]
+            actual = self._node_for(node_id).get_checksum(info.chunk_id)["checksum"]
         except NodeUnavailable:
+            if unreachable is not None:
+                unreachable.add(node_id)
             return "down"
         except (KeyError, ValueError):
             return "missing"
@@ -463,6 +632,7 @@ class Distributor:
         """
         chunks = []
         counts = {"healthy": 0, "under_replicated": 0, "unavailable": 0}
+        unreachable = set()          # nodes that failed during this report
 
         # list(...): an upload finishing meanwhile must not change the dict
         # while we loop over it.
@@ -470,7 +640,7 @@ class Distributor:
             for info in sorted(meta.chunks, key=lambda c: c.index):
                 replicas = []
                 for node_id in info.replicas:
-                    state = self._check_copy(node_id, info)
+                    state = self._check_copy(node_id, info, unreachable)
                     replicas.append({
                         "node": node_id,
                         "node_up": state != "down",
@@ -524,10 +694,11 @@ class Distributor:
         try:
             result = {"chunks_checked": 0, "healthy": 0, "repaired": 0, "partial": 0,
                       "unrecoverable": 0, "copies_created": 0, "left_behind": [], "details": []}
+            unreachable = set()      # nodes that failed during this repair
             for meta in list(self.metadata.values()):
                 for info in sorted(meta.chunks, key=lambda c: c.index):
                     result["chunks_checked"] += 1
-                    outcome = self._repair_chunk(meta, info, result)
+                    outcome = self._repair_chunk(meta, info, result, unreachable)
                     result[outcome] += 1
             print(f"[repair] checked {result['chunks_checked']} chunk(s): "
                   f"{result['repaired']} repaired, {result['partial']} partial, "
@@ -536,10 +707,10 @@ class Distributor:
         finally:
             self._repair_lock.release()
 
-    def _repair_chunk(self, meta: ObjectMetadata, info: ChunkInfo, result: dict) -> str:
+    def _repair_chunk(self, meta: ObjectMetadata, info: ChunkInfo, result: dict, unreachable: set = None) -> str:
         """Repair one chunk. Returns 'healthy', 'repaired', 'partial' or
         'unrecoverable'; details go into `result`."""
-        states = {node_id: self._check_copy(node_id, info) for node_id in list(info.replicas)}
+        states = {node_id: self._check_copy(node_id, info, unreachable) for node_id in list(info.replicas)}
         good = [n for n, s in states.items() if s == "ok"]
         if len(good) >= self.replication_factor:
             return "healthy"
@@ -558,7 +729,7 @@ class Distributor:
         data = None
         for node_id in good:
             try:
-                candidate = self._get_node(node_id).get_chunk(info.chunk_id)
+                candidate = self._node_for(node_id).get_chunk(info.chunk_id)
             except (NodeUnavailable, KeyError, ChunkCorrupt):
                 continue
             if verify(candidate, info.checksum):
@@ -579,9 +750,10 @@ class Distributor:
         tried = set()
         while len(added) < need:
             taken = tried | set(added)
-            picked = self._pick_nodes(len(data), 1, exclude=set(info.replicas) | taken)
+            partners = good + added
+            picked = self._pick_nodes(len(data), 1, exclude=set(info.replicas) | taken, partners=partners)
             if picked is None:
-                picked = self._pick_nodes(len(data), 1, exclude=set(good) | taken)
+                picked = self._pick_nodes(len(data), 1, exclude=set(good) | taken, partners=partners)
             if picked is None:
                 break   # no more candidates: the chunk stays short of copies
             node = picked[0]
@@ -610,10 +782,14 @@ class Distributor:
             still_there = self.metadata.get(meta.object_id) is meta
             if still_there:
                 info.replicas = good + added + kept_down
+                self._save()
+        if still_there and added:
+            for new in added:
+                self._note_copies([new] + [n for n in info.replicas if n != new and n not in added])
         if not still_there:
             for node_id in added:
                 try:
-                    self._get_node(node_id).delete_chunk(info.chunk_id)
+                    self._node_for(node_id).delete_chunk(info.chunk_id)
                 except NodeUnavailable:
                     pass
             return "healthy"
@@ -626,7 +802,7 @@ class Distributor:
                 result["left_behind"].append({"node": node_id, "chunk_id": info.chunk_id})
             elif states[node_id] == "corrupt":
                 try:
-                    self._get_node(node_id).delete_chunk(info.chunk_id)
+                    self._node_for(node_id).delete_chunk(info.chunk_id)
                 except NodeUnavailable:
                     result["left_behind"].append({"node": node_id, "chunk_id": info.chunk_id})
 
@@ -637,3 +813,187 @@ class Distributor:
         print(f"[repair] chunk {info.chunk_id}: now on {', '.join(info.replicas)}"
               + ("" if complete else " (still short of copies: not enough live nodes with room)"))
         return detail["outcome"]
+
+    # ------------------------------------------------------------------
+    # what is really on a worker: orphans and missing chunks
+    # ------------------------------------------------------------------
+    def _expected_on(self, node_id: str) -> dict:
+        """chunk_id -> object_id of every chunk the metadata says this node holds."""
+        with self._lock:
+            return {info.chunk_id: meta.object_id
+                    for meta in self.metadata.values() for info in meta.chunks
+                    if node_id in info.replicas}
+
+    @staticmethod
+    def _object_of(chunk_id: str) -> str:
+        """Chunk ids are '<object_id>-<index>'."""
+        return chunk_id.rsplit("-", 1)[0]
+
+    def worker_inventory(self, node_id: str) -> dict:
+        """Compare what a worker really holds with what the metadata says it
+        should hold. Raises KeyError for an unknown worker, NodeUnavailable if
+        it cannot be reached.
+
+          orphans  held, but no object points to this copy (left by a delete or
+                   a repair while the worker was down, or a rolled-back upload).
+                   A chunk of an upload still in progress is listed under
+                   'in_progress' instead.
+          missing  the metadata says it is here, but it is not."""
+        node = self._get_node(node_id)
+        held = node.list_chunks()
+        expected = self._expected_on(node_id)
+        held_ids = {c["chunk_id"] for c in held}
+        orphans, in_progress = [], []
+        for c in held:
+            if c["chunk_id"] in expected:
+                continue
+            (in_progress if self._object_of(c["chunk_id"]) in self._in_flight else orphans).append(c)
+        return {
+            "worker_id": node_id,
+            "held": len(held),
+            "expected": len(expected),
+            "orphans": orphans,
+            "in_progress": in_progress,
+            "missing": sorted(c for c in expected if c not in held_ids),
+        }
+
+    def _chunk_info(self, chunk_id: str):
+        """(ObjectMetadata, ChunkInfo) of a chunk, or (None, None) if its object is gone."""
+        with self._lock:
+            meta = self.metadata.get(self._object_of(chunk_id))
+            if meta is None:
+                return None, None
+            for info in meta.chunks:
+                if info.chunk_id == chunk_id:
+                    return meta, info
+        return None, None
+
+    def _adopt_if_needed(self, node, chunk_id: str) -> bool:
+        """An orphaned copy is about to be deleted. If its chunk has FEWER good
+        copies than required and this copy is intact (it matches the checksum
+        recorded at upload), take it back into the chunk's replica list
+        instead, so cleanup never lowers a chunk's good copies. Returns True if
+        the copy was adopted (and must not be deleted)."""
+        meta, info = self._chunk_info(chunk_id)
+        if info is None:
+            return False                                  # its object was deleted: just an orphan
+        states = {n: self._check_copy(n, info) for n in list(info.replicas)}
+        good = [n for n, s in states.items() if s == "ok"]
+        if len(good) >= self.replication_factor:
+            return False                                  # enough good copies: this one is surplus
+        try:
+            intact = node.get_checksum(chunk_id)["checksum"] == info.checksum
+        except (KeyError, ValueError, NodeUnavailable):
+            intact = False
+        if not intact:
+            return False                                  # damaged too: no use keeping it
+        with self._lock:
+            if self.metadata.get(meta.object_id) is not meta or node.node_id in info.replicas:
+                return False
+            new = good + [node.node_id]
+            short = max(0, self.replication_factor - len(new))
+            # a copy on a worker that is only down may come back: keep it while still short
+            new += [n for n in info.replicas if states.get(n) == "down" and n not in new][:short]
+            info.replicas = new
+            self._save()
+        self._note_copies(info.replicas)
+        print(f"[cleanup] chunk {chunk_id} had only {len(good)} good copy/copies: "
+              f"kept the intact copy on {node.node_id} instead of deleting it")
+        return True
+
+    def cleanup_orphans(self, min_age: float = 60.0) -> dict:
+        """Delete orphaned chunks on every reachable worker.
+
+        Never lowers a chunk below the required number of good copies: an
+        orphan whose chunk is short of good copies, and that is itself intact,
+        is taken back into the chunk's replica list ('adopted') instead of
+        being deleted. Only surplus copies (the chunk already has enough good
+        copies), damaged ones, and copies of deleted objects are deleted.
+
+        Safe only if the metadata is the full truth: with metadata kept only
+        in memory, a controller that has just restarted knows no objects and
+        would see EVERY chunk as an orphan. So this refuses (RuntimeError)
+        unless the metadata is persistent. It also never deletes a chunk
+        younger than min_age seconds or one belonging to an upload still in
+        progress, and does not run during a repair (RuntimeError)."""
+        if not self.persistent:
+            raise RuntimeError("Cleanup needs saved metadata (METADATA_PATH): with metadata only in "
+                               "memory, every chunk looks like an orphan after a restart")
+        if not self._repair_lock.acquire(blocking=False):
+            raise RuntimeError("A repair or cleanup is already running")
+        try:
+            result = {"deleted": [], "adopted": [], "kept_young": [], "unreachable": []}
+            for node in list(self.nodes):
+                try:
+                    report = self.worker_inventory(node.node_id)
+                except NodeUnavailable:
+                    result["unreachable"].append(node.node_id)
+                    continue
+                for c in report["orphans"]:
+                    entry = {"node": node.node_id, "chunk_id": c["chunk_id"]}
+                    if c["age"] < min_age:
+                        result["kept_young"].append(entry)
+                        continue
+                    # look again right before deleting: an upload or repair may
+                    # have claimed it since the inventory was taken
+                    if c["chunk_id"] in self._expected_on(node.node_id) \
+                            or self._object_of(c["chunk_id"]) in self._in_flight:
+                        continue
+                    if self._adopt_if_needed(node, c["chunk_id"]):
+                        result["adopted"].append(entry)
+                        continue
+                    try:
+                        node.delete_chunk(c["chunk_id"])
+                        result["deleted"].append(entry)
+                    except NodeUnavailable:
+                        result["unreachable"].append(node.node_id)
+                        break
+            print(f"[cleanup] deleted {len(result['deleted'])} orphaned chunk(s), "
+                  f"adopted {len(result['adopted'])}, kept {len(result['kept_young'])} recent one(s)")
+            return result
+        finally:
+            self._repair_lock.release()
+
+    # ------------------------------------------------------------------
+    # automatic repair
+    # ------------------------------------------------------------------
+    def auto_repair_check(self, grace: float):
+        """Called every few seconds by the controller's background thread.
+
+        A worker that has been down for `grace` seconds triggers a repair, so
+        the replication factor is restored without anyone calling the repair
+        endpoint. A worker that comes back within the grace period (a quick
+        restart) triggers nothing, so no copying happens for nothing. Each
+        failure is repaired for once; if that repair could not create every
+        copy (not enough room), it is tried again after another grace period.
+        Returns the repair result, or None if nothing was done."""
+        now = time.monotonic()
+        overdue = []
+        for node in list(self.nodes):
+            alive, _ = self._cached_state(node)
+            if alive:
+                self._down_since.pop(node.node_id, None)
+                self._repaired_for.discard(node.node_id)
+                continue
+            since = self._down_since.setdefault(node.node_id, now)
+            if now - since >= grace and node.node_id not in self._repaired_for:
+                overdue.append(node.node_id)
+        if not overdue:
+            return None
+        try:
+            result = self.repair()
+        except RuntimeError:
+            return None          # a repair is already running: look again next time
+        if result["partial"] or result["unrecoverable"]:
+            for n in overdue:
+                self._down_since[n] = now        # try again after another grace period
+        else:
+            self._repaired_for.update(overdue)
+        self.last_auto_repair = {
+            "at": _now(),
+            "because_down": overdue,
+            **{k: result[k] for k in ("chunks_checked", "repaired", "partial", "unrecoverable", "copies_created")},
+        }
+        print(f"[auto-repair] {', '.join(overdue)} down for {grace:g}s or more: "
+              f"{result['repaired']} chunk(s) repaired, {result['copies_created']} copy/copies created")
+        return result

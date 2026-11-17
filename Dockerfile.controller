@@ -1,0 +1,56 @@
+# The CONTROLLER image: app.py + controller/ + helpers/ + config.py.
+# One container of this kind runs in the final system.
+#
+# Build from the project's top folder (docker compose does this for you):
+#     docker build -f Dockerfile.controller -t object-store-controller .
+#
+# Which files go in is decided by Dockerfile.controller.dockerignore.
+
+# Same Python minor version the project was developed and tested with.
+FROM python:3.11-slim
+
+# No .pyc files in the image, and print output straight away (so `docker logs`
+# shows it as it happens).
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Dependencies first: this layer is reused as long as requirements.txt is the same.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# The code. The program is started from /app, because it imports "helpers" and
+# "controller" as packages.
+COPY . .
+
+# Settings (override them with `docker run -e` or in docker-compose.yml):
+#   HOST                0.0.0.0 so other containers and the host can connect
+#   PORT                the API's port
+#   CHUNK_SIZE          bytes per chunk (default 1 MB)
+#   REPLICATION_FACTOR  copies of every chunk (default 2)
+#   METADATA_PATH       where the metadata is saved: in the volume below
+#   AUTO_REPAIR_GRACE   seconds a worker may be down before repair starts (0: off)
+# No worker list is needed: the workers register themselves when they start.
+ENV HOST=0.0.0.0 \
+    PORT=5000 \
+    METADATA_PATH=/meta/metadata.json
+
+# Do not run as root inside the container. /meta is created and owned by that
+# user BEFORE it is declared a volume, so a new volume starts out writable.
+RUN useradd --create-home --uid 10001 app \
+    && mkdir /meta \
+    && chown app:app /meta
+USER app
+
+# PERSISTENT METADATA: every object's metadata is saved in /meta, so restarting
+# or re-creating the controller keeps every object (the chunks are on the workers).
+VOLUME ["/meta"]
+
+EXPOSE 5000
+
+# Healthy when the API answers. Listing objects is cheap and does not probe workers.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/api/v1/objects' % os.environ.get('PORT', '5000'), timeout=2)"
+
+CMD ["python", "app.py"]

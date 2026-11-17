@@ -1,7 +1,10 @@
 """Client: talks to the Flask API (the distributor) over HTTP.
 
-Upload  : file path -> read_document -> serialize -> POST to distributor
-Download: GET from distributor -> deserialize -> save_document
+Upload  : file path -> read the bytes -> POST them (with their checksum) to the API
+Download: GET from the API -> check the checksum -> save the bytes
+
+The bytes stored are exactly the file's bytes, so a download with curl or a
+browser gives back the original file too.
 
 Objects are identified by the object_id the server returns on upload; the
 list option shows the ids of everything stored.
@@ -10,18 +13,30 @@ list option shows the ids of everything stored.
 import json
 import mimetypes
 import os
+import socket
+import sys
+
 import requests
 
 from helpers.checksum import compute, verify
 from helpers.file_upload import read_document, save_document
-from helpers.serDe import serialize, deserialize
 
-BASE_URL = "http://127.0.0.1:5000/api/v1"   # not "localhost": slow on Windows (IPv6 first)
+# Where the API is. Override with API_URL (in Docker: http://controller:5000/api/v1).
+# Default uses 127.0.0.1, not "localhost": slow on Windows (IPv6 first).
+BASE_URL = os.environ.get("API_URL", "http://127.0.0.1:5000/api/v1")
+
+
+def default_client_id() -> str:
+    """Who this client is: CLIENT_ID from the environment, else the machine's
+    name. It should stay the same between runs (in Docker, set CLIENT_ID: a
+    container's own hostname changes every time it is created)."""
+    return os.environ.get("CLIENT_ID") or socket.gethostname()
 
 
 class Client:
-    def __init__(self, base_url: str = BASE_URL):
+    def __init__(self, base_url: str = BASE_URL, client_id: str = None):
         self.base_url = base_url
+        self.client_id = client_id or default_client_id()
 
     @staticmethod
     def _check(response) -> None:
@@ -35,20 +50,20 @@ class Client:
         raise ValueError(f"Server said {response.status_code}: {message}")
 
     def upload(self, path: str, metadata: dict = None) -> dict:
-        """Read the file, serialize it to binary, send it together with its
-        checksum (so the server can detect damage in transit), its content type,
-        its full path (two uploads from the same path are refused as the same
-        file) and optional custom metadata. Returns the new object's metadata
-        (object_id, size, content_type, times, chunks...)."""
-        document = read_document(path)
-        data = serialize(document)
+        """Read the file and send its bytes together with their checksum (so
+        the server can detect damage in transit), its content type, its full
+        path and this client's id (two uploads from the same path by the same
+        client are refused as the same file) and optional custom metadata.
+        Returns the new object's metadata (object_id, size, content_type,
+        times, chunks...)."""
+        data = read_document(path)
 
         name = os.path.basename(path)
         content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
         form = {
             "checksum": compute(data),               # fingerprint of exactly these bytes
             "path": os.path.abspath(path),
-            "size": str(len(document)),              # the original size, not the wrapped one
+            "client_id": self.client_id,             # the duplicate rule is per client + path
         }
         if metadata:
             form["metadata"] = json.dumps(metadata)
@@ -63,7 +78,7 @@ class Client:
 
     def retrieve(self, object_id: str, save_to: str = None) -> str:
         """Fetch the object by id, verify it against the checksum the server
-        sent, deserialize it, and write it to save_to. Without save_to, it is
+        sent, and write it to save_to. Without save_to, it is
         saved under its original name (taken from the metadata) in the current
         folder, and an existing file is never overwritten. Returns the path it
         was saved to. Raises ValueError if the data arrived damaged."""
@@ -74,7 +89,7 @@ class Client:
         if expected and not verify(response.content, expected):
             raise ValueError("Checksum mismatch: the download was damaged in transit")
 
-        document = deserialize(response.content)
+        document = response.content
 
         if save_to is None:
             name = os.path.basename(self.get_metadata(object_id)["name"]) or object_id
@@ -132,7 +147,64 @@ def parse_pairs(text: str) -> dict:
     return result
 
 
-def main():
+USAGE = """\
+python client.py                               the menu (interactive)
+python client.py upload FILE [k=v,k2=v2]       upload, with optional custom metadata
+python client.py download OBJECT_ID [SAVE_AS]  download (saved under its own name by default)
+python client.py list                          list the stored objects
+python client.py info OBJECT_ID                show an object's metadata
+python client.py update OBJECT_ID k=v,k2=null  change custom metadata (null removes a key)
+python client.py delete OBJECT_ID              delete an object
+
+Settings: API_URL (default http://127.0.0.1:5000/api/v1) and CLIENT_ID."""
+
+
+def run_command(client: "Client", args: list) -> int:
+    """One command without the menu (used by the client containers and
+    scripts). Prints the result; returns the exit code (0 ok, 1 error, 2 bad usage)."""
+    command, rest = args[0], args[1:]
+    arity = {"upload": (1, 2), "download": (1, 2), "list": (0, 0), "info": (1, 1),
+             "update": (2, 2), "delete": (1, 1)}
+    if command not in arity or not arity[command][0] <= len(rest) <= arity[command][1]:
+        print(USAGE)
+        return 2
+    try:
+        if command == "upload":
+            info = client.upload(rest[0], parse_pairs(rest[1]) if len(rest) > 1 else None)
+            print(f"Uploaded '{info['name']}' as client '{client.client_id}': {info['size']} bytes in "
+                  f"{info['chunk_count']} chunk(s)")
+            for c in info["chunks"]:
+                print(f"  chunk {c['index']}: {', '.join(c['replicas'])}")
+            print(f"object_id: {info['object_id']}")
+        elif command == "download":
+            print(f"Saved to {client.retrieve(rest[0], rest[1] if len(rest) > 1 else None)}")
+        elif command == "list":
+            objects = client.list_objects()
+            if not objects:
+                print("Nothing stored yet.")
+            for o in objects:
+                print(f"{o['object_id']}  {o['name']}  {o['size']} bytes  {o['content_type']}")
+        elif command == "info":
+            print(json.dumps(client.get_metadata(rest[0]), indent=2))
+        elif command == "update":
+            print(json.dumps(client.update_metadata(rest[0], parse_pairs(rest[1]))["custom"], indent=2))
+        elif command == "delete":
+            client.delete(rest[0])
+            print("Deleted.")
+        return 0
+    except (OSError, ValueError, requests.RequestException) as e:
+        print(f"Error: {e}")
+        return 1
+
+
+def main(argv=None):
+    """No arguments: the menu. Otherwise one command (see USAGE)."""
+    args = sys.argv[1:] if argv is None else list(argv)
+    if args:
+        if args[0] in ("-h", "--help", "help"):
+            print(USAGE)
+            return 0
+        return run_command(Client(), args)
     client = Client()
     while True:
         print("\n1. Upload\n2. Download\n3. List objects\n4. Show metadata\n"
@@ -168,7 +240,7 @@ def main():
                 client.delete(object_id)
                 print("Deleted.")
             elif choice == "7":
-                break
+                return 0
             else:
                 print("Please enter 1-7.")
         except (OSError, ValueError, requests.RequestException) as e:
@@ -176,4 +248,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
