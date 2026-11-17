@@ -1,4 +1,4 @@
-"""helpers/: checksum, serDe, file_upload."""
+"""helpers/: checksum, file_upload."""
 import hashlib
 import os
 
@@ -6,7 +6,6 @@ import pytest
 
 from helpers.checksum import compute, verify
 from helpers.file_upload import read_document, read_file, save_document, save_file
-from helpers.serDe import HEADER_SIZE, MAGIC, deserialize, serialize
 
 
 # ---------------------------------------------------------------- checksum
@@ -42,51 +41,6 @@ class TestChecksum:
     def test_verify_rejects_garbage_expected_values(self, bad):
         assert not verify(b"data", bad)
 
-
-# -------------------------------------------------------------------- serDe
-class TestSerDe:
-    @pytest.mark.parametrize("size", [0, 1, 255, 4096, 1024 * 1024 + 7])
-    def test_round_trip(self, size):
-        data = os.urandom(size)
-        assert deserialize(serialize(data)) == data
-
-    def test_layout(self):
-        blob = serialize(b"abc")
-        assert blob[:4] == MAGIC == b"OBJ1"
-        assert int.from_bytes(blob[4:12], "big") == 3
-        assert blob[12:44] == hashlib.sha256(b"abc").digest()
-        assert blob[HEADER_SIZE:] == b"abc"
-        assert HEADER_SIZE == 44
-
-    def test_content_is_never_decoded(self):
-        data = bytes(range(256)) + b"\r\n\x00\xff\xfe"
-        assert deserialize(serialize(data)) == data
-
-    def test_rejects_data_without_the_header(self):
-        for blob in (b"", b"OBJ1", b"x" * 100, b"OBJ2" + b"\x00" * 60):
-            with pytest.raises(ValueError, match="bad header"):
-                deserialize(blob)
-
-    def test_rejects_truncated_payload(self):
-        blob = serialize(b"x" * 100)
-        with pytest.raises(ValueError, match="Incomplete"):
-            deserialize(blob[:-1])
-
-    def test_rejects_extra_bytes(self):
-        with pytest.raises(ValueError, match="Incomplete"):
-            deserialize(serialize(b"x" * 10) + b"extra")
-
-    def test_rejects_a_changed_payload_byte(self):
-        blob = bytearray(serialize(b"x" * 100))
-        blob[HEADER_SIZE + 50] ^= 0xFF
-        with pytest.raises(ValueError, match="corrupted"):
-            deserialize(bytes(blob))
-
-    def test_rejects_a_changed_checksum_in_the_header(self):
-        blob = bytearray(serialize(b"x" * 100))
-        blob[20] ^= 0xFF
-        with pytest.raises(ValueError, match="corrupted"):
-            deserialize(bytes(blob))
 
 
 # -------------------------------------------------------------- file_upload

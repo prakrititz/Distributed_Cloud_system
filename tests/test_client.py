@@ -102,6 +102,86 @@ class TestClientAgainstTheCluster:
         assert not (tmp_path / "out.bin").exists()
 
 
+class TestOriginalBytes:
+    """The stored bytes are the file's own bytes (issue #17): the client, curl
+    and a browser all get back exactly the original file."""
+
+    def test_uploaded_by_the_client_downloaded_with_plain_http(self, cluster, tmp_path):
+        import requests
+        data = os.urandom(3 * 1024 * 1024 + 17)
+        src = tmp_path / "video.mp4"
+        src.write_bytes(data)
+        m = Client(base_url=cluster.api, client_id="t").upload(str(src))
+        assert m["size"] == len(data) and m["checksum"] == client_module.compute(data)
+        r = requests.get(f"{cluster.api}/objects/{m['object_id']}", timeout=60)
+        assert r.status_code == 200 and r.content == data
+        assert r.headers["Content-Type"].startswith("video/mp4")
+
+    def test_uploaded_with_plain_http_downloaded_by_the_client(self, cluster, tmp_path):
+        import requests
+        data = os.urandom(5000)
+        r = requests.post(cluster.api + "/objects", files={"file": ("raw.bin", data)}, timeout=60)
+        out = tmp_path / "raw.bin"
+        Client(base_url=cluster.api).retrieve(r.json()["object_id"], str(out))
+        assert out.read_bytes() == data
+
+    def test_what_lies_on_the_workers_is_the_file_itself(self, cluster, tmp_path):
+        data = os.urandom(1000)
+        src = tmp_path / "small.bin"
+        src.write_bytes(data)
+        m = Client(base_url=cluster.api, client_id="t").upload(str(src))
+        chunk = m["chunks"][0]
+        assert open(cluster.chunk_path(chunk["replicas"][0], chunk["chunk_id"]), "rb").read() == data
+
+
+class TestCommands:
+    """python client.py <command> ...: the client without the menu, as the
+    client containers use it."""
+
+    @pytest.fixture
+    def run(self, cluster, monkeypatch, capsys):
+        monkeypatch.setenv("CLIENT_ID", "cli")                    # read by Client() like in a container
+        real_client = client_module.Client
+        monkeypatch.setattr(client_module, "Client", lambda: real_client(base_url=cluster.api))
+
+        def run(*args):
+            code = client_module.main(list(args))
+            return code, capsys.readouterr().out
+        return run
+
+    def test_a_whole_session(self, run, tmp_path):
+        src = tmp_path / "notes.txt"
+        src.write_bytes(b"hello\r\n")
+        code, out = run("upload", str(src), "project=demo")
+        assert code == 0 and "as client 'cli'" in out and "chunk 0:" in out
+        oid = out.strip().splitlines()[-1].split("object_id: ")[1]
+
+        assert run("list")[1].count(oid) == 1
+        code, out = run("info", oid)
+        assert code == 0 and '"project": "demo"' in out and '"client_id": "cli"' in out
+        code, out = run("update", oid, "project=null,stage=2")
+        assert code == 0 and '"stage": "2"' in out and "project" not in out
+        code, out = run("download", oid, str(tmp_path / "copy.txt"))
+        assert code == 0 and (tmp_path / "copy.txt").read_bytes() == b"hello\r\n"
+        code, out = run("delete", oid)              # (the controller's own log lines are in `out` too)
+        assert code == 0 and "Deleted." in out
+        assert "Nothing stored yet." in run("list")[1]
+
+    def test_errors_give_exit_code_1(self, run):
+        code, out = run("info", "no-such-id")
+        assert code == 1 and "404" in out
+        code, out = run("upload", "does-not-exist.txt")
+        assert code == 1 and "Error" in out
+
+    @pytest.mark.parametrize("args", [("frobnicate",), ("upload",), ("list", "extra"), ("update", "id")])
+    def test_bad_usage_prints_help_and_gives_2(self, run, args):
+        code, out = run(*args)
+        assert code == 2 and "python client.py upload FILE" in out
+
+    def test_help(self, run):
+        assert run("--help")[0] == 0
+
+
 class TestMenu:
     def test_a_scripted_session(self, cluster, tmp_path, monkeypatch, capsys):
         src = tmp_path / "src" / "todo.txt"
@@ -136,7 +216,7 @@ class TestMenu:
             return value() if callable(value) else value
 
         monkeypatch.setattr(builtins, "input", fake_input)
-        client_module.main()
+        assert client_module.main([]) == 0
         out = capsys.readouterr().out
         assert "Uploaded 'todo.txt'" in out and "Object ID:" in out
         assert '"project": "demo"' in out and '"stage": "2"' in out and "owner" not in out.split("Saved to")[0].split('"stage"')[-1]
