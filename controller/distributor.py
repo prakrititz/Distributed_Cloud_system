@@ -238,6 +238,17 @@ class Distributor:
         alive = seen is not None and time.monotonic() - seen <= self.heartbeat_timeout
         return alive, entry["free"]
 
+    def counts_as_down(self, node_id: str) -> bool:
+        """True if the controller already counts this node as down (no
+        heartbeat for heartbeat_timeout, or a request to it just failed),
+        without asking it. A node never heard of is not counted down."""
+        with self._status_lock:
+            entry = self._status.get(node_id)
+        if entry is None:
+            return False
+        seen = entry["last_seen"]
+        return seen is None or time.monotonic() - seen > self.heartbeat_timeout
+
     def heartbeat_age(self, node_id: str):
         """Seconds since the node last reported, or None if it never has."""
         with self._status_lock:
@@ -584,16 +595,26 @@ class Distributor:
     # ------------------------------------------------------------------
     # health (read-only report) and repair
     # ------------------------------------------------------------------
-    def _check_copy(self, node_id: str, info: ChunkInfo) -> str:
+    def _check_copy(self, node_id: str, info: ChunkInfo, unreachable: set = None) -> str:
         """Judge one copy of a chunk without downloading it: ask the node to
         recompute the checksum of what is on its disk and compare it with the
         checksum the distributor recorded at upload.
 
         Returns 'ok', 'down' (node unreachable), 'missing' (node is up but
-        has no such chunk) or 'corrupt' (the bytes no longer match)."""
+        has no such chunk) or 'corrupt' (the bytes no longer match).
+
+        A node the controller already counts as down is not asked (asking a
+        dead container can take seconds: its name no longer resolves).
+        `unreachable`, if given, is the set of nodes that already failed in
+        this pass over the chunks; a node that fails is added to it, so a dead
+        node costs one failed request per pass, not one per copy."""
+        if (unreachable is not None and node_id in unreachable) or self.counts_as_down(node_id):
+            return "down"
         try:
             actual = self._node_for(node_id).get_checksum(info.chunk_id)["checksum"]
         except NodeUnavailable:
+            if unreachable is not None:
+                unreachable.add(node_id)
             return "down"
         except (KeyError, ValueError):
             return "missing"
@@ -611,6 +632,7 @@ class Distributor:
         """
         chunks = []
         counts = {"healthy": 0, "under_replicated": 0, "unavailable": 0}
+        unreachable = set()          # nodes that failed during this report
 
         # list(...): an upload finishing meanwhile must not change the dict
         # while we loop over it.
@@ -618,7 +640,7 @@ class Distributor:
             for info in sorted(meta.chunks, key=lambda c: c.index):
                 replicas = []
                 for node_id in info.replicas:
-                    state = self._check_copy(node_id, info)
+                    state = self._check_copy(node_id, info, unreachable)
                     replicas.append({
                         "node": node_id,
                         "node_up": state != "down",
@@ -672,10 +694,11 @@ class Distributor:
         try:
             result = {"chunks_checked": 0, "healthy": 0, "repaired": 0, "partial": 0,
                       "unrecoverable": 0, "copies_created": 0, "left_behind": [], "details": []}
+            unreachable = set()      # nodes that failed during this repair
             for meta in list(self.metadata.values()):
                 for info in sorted(meta.chunks, key=lambda c: c.index):
                     result["chunks_checked"] += 1
-                    outcome = self._repair_chunk(meta, info, result)
+                    outcome = self._repair_chunk(meta, info, result, unreachable)
                     result[outcome] += 1
             print(f"[repair] checked {result['chunks_checked']} chunk(s): "
                   f"{result['repaired']} repaired, {result['partial']} partial, "
@@ -684,10 +707,10 @@ class Distributor:
         finally:
             self._repair_lock.release()
 
-    def _repair_chunk(self, meta: ObjectMetadata, info: ChunkInfo, result: dict) -> str:
+    def _repair_chunk(self, meta: ObjectMetadata, info: ChunkInfo, result: dict, unreachable: set = None) -> str:
         """Repair one chunk. Returns 'healthy', 'repaired', 'partial' or
         'unrecoverable'; details go into `result`."""
-        states = {node_id: self._check_copy(node_id, info) for node_id in list(info.replicas)}
+        states = {node_id: self._check_copy(node_id, info, unreachable) for node_id in list(info.replicas)}
         good = [n for n, s in states.items() if s == "ok"]
         if len(good) >= self.replication_factor:
             return "healthy"

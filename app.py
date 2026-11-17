@@ -15,6 +15,7 @@ import mimetypes
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, request, jsonify, send_file
 from werkzeug.exceptions import HTTPException
@@ -283,25 +284,27 @@ def delete_object(object_id):
 @app.route("/api/v1/nodes", methods=["GET"])
 def show_nodes():
     """Debug endpoint: up/down state and free/used space of each node.
-    Asks each node's server for its health; a node that cannot be reached
-    is listed as down. To test a failure, stop that node's server process."""
-    report = []
-    for n in distributor.nodes:
+    Asks each node's server for its health, all at once; a node that cannot
+    be reached is listed as down. A node the controller already counts as
+    down (no heartbeat for HEARTBEAT_TIMEOUT) is not asked: asking a stopped
+    container can take seconds, because its name no longer resolves. To test
+    a failure, stop that node's server process."""
+    def probe(n):
+        down = {"node": n.node_id, "alive": False, "heartbeat_age": distributor.heartbeat_age(n.node_id)}
+        if distributor.counts_as_down(n.node_id):
+            return down
         try:
-            h = n.health()   # one request per node
-            report.append({
-                "node": n.node_id,
-                "alive": True,
-                "capacity": h["capacity"],
-                "used": h["used"],
-                "free": h["free"],
-                "chunks": h["chunks"],
-                "heartbeat_age": distributor.heartbeat_age(n.node_id),
-            })
+            h = n.health()
         except NodeUnavailable:
-            report.append({"node": n.node_id, "alive": False,
-                           "heartbeat_age": distributor.heartbeat_age(n.node_id)})
-    return jsonify(report)
+            return down
+        return {"node": n.node_id, "alive": True, "capacity": h["capacity"], "used": h["used"],
+                "free": h["free"], "chunks": h["chunks"], "heartbeat_age": distributor.heartbeat_age(n.node_id)}
+
+    nodes = list(distributor.nodes)
+    if not nodes:
+        return jsonify([])
+    with ThreadPoolExecutor(max_workers=min(32, len(nodes))) as pool:
+        return jsonify(list(pool.map(probe, nodes)))
 
 
 @app.route("/api/v1/replication", methods=["GET"])
