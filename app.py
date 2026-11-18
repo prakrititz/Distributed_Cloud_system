@@ -9,7 +9,6 @@ so start them in any order, and as many as you like. Each worker's capacity is
 set on its own server (CAPACITY), not here. The chunk size and the number of
 copies per chunk are CHUNK_SIZE and REPLICATION_FACTOR (see config.py).
 """
-import io
 import json
 import mimetypes
 import os
@@ -17,16 +16,15 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, Response, request, jsonify
 from werkzeug.exceptions import HTTPException
 
-from config import (AUTO_REPAIR_GRACE, CHUNK_SIZE, HEARTBEAT_INTERVAL, METADATA_PATH, NODE_ADDRESSES,
-                    ORPHAN_MIN_AGE, REPLICATION_FACTOR)
+from config import (AUTO_REPAIR_GRACE, CHUNK_SIZE, HEARTBEAT_INTERVAL, MAX_TRANSFERS, METADATA_PATH,
+                    NODE_ADDRESSES, ORPHAN_MIN_AGE, REPLICATION_FACTOR)
 from controller.distributor import DEFAULT_CONTENT_TYPE, Distributor
 from controller.metadata_store import store_from_setting
 from controller.remote_node import RemoteNode
-from helpers.checksum import compute, verify
-from helpers.errors import NodeUnavailable
+from helpers.errors import ChecksumMismatch, NodeUnavailable
 
 app = Flask(__name__)
 
@@ -42,6 +40,34 @@ distributor = Distributor([RemoteNode(node_id, url) for node_id, url in NODE_ADD
                           chunk_size=CHUNK_SIZE, replication_factor=REPLICATION_FACTOR,
                           store=store_from_setting(METADATA_PATH))
 auto_repair = {"enabled": False, "grace_seconds": AUTO_REPAIR_GRACE}   # switched on in __main__
+
+
+class TransferSlots:
+    """At most `limit` uploads and downloads at once. Each streams one chunk
+    at a time, so this bounds the controller's memory: about limit x chunk
+    size, whatever the size of the files."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self._free = threading.BoundedSemaphore(limit)
+
+    def take(self) -> bool:
+        """Take a slot if one is free (never waits). False if all are in use."""
+        return self._free.acquire(blocking=False)
+
+    def give_back(self) -> None:
+        self._free.release()
+
+
+transfers = TransferSlots(MAX_TRANSFERS)
+
+
+def busy():
+    """503 when every transfer slot is in use."""
+    response, status = error(f"The controller is busy: {transfers.limit} uploads and downloads are "
+                             "already running. Try again in a moment", 503)
+    response.headers["Retry-After"] = "1"
+    return response, status
 
 
 def auto_repair_loop(grace: float, interval: float = HEARTBEAT_INTERVAL) -> None:
@@ -110,7 +136,8 @@ def object_json(meta) -> dict:
         "chunk_count": len(meta.chunks),
         "copies_per_chunk": distributor.replication_factor,
         "chunks": [
-            {"index": c.index, "chunk_id": c.chunk_id, "checksum": c.checksum, "replicas": c.replicas}
+            {"index": c.index, "chunk_id": c.chunk_id, "size": c.size, "checksum": c.checksum,
+             "replicas": c.replicas}
             for c in sorted(meta.chunks, key=lambda c: c.index)
         ],
         "custom": meta.custom,
@@ -119,11 +146,24 @@ def object_json(meta) -> dict:
 
 @app.route("/api/v1/objects", methods=["POST"])
 def upload_object():
-    """Upload an object (multipart/form-data).
+    """Upload an object. Either way, it is stored one chunk at a time as it is
+    read, so the controller never holds the whole file in memory.
 
-    Fields: 'file' (required) and, all optional:
+    Two ways to send it:
+      multipart/form-data (curl -F, HTML forms): the file in the 'file' field,
+          the fields below as form fields. The web server first writes the
+          whole upload to a temporary file, which is then read chunk by chunk.
+      raw (client.py): the request body is the file itself, the fields below
+          go in the query string, 'name' (the file name) is required, and the
+          Content-Type header is the object's content type. Chunks go to the
+          workers while the body is still arriving. With curl:
+          curl -X POST -T report.pdf "http://HOST/api/v1/objects?name=report.pdf"
+
+    Fields, all optional (except 'name' for a raw upload):
       'metadata'  JSON object of custom key-value metadata
-      'checksum'  checksum of the file; verified before anything is stored
+      'checksum'  checksum of the file. The checksum of what arrives is
+                  computed as the chunks go by and compared at the end; on a
+                  mismatch everything stored is deleted again
       'path'      where the client read the file from. Two uploads from the
                   same path by the same client are the same file, so the
                   second is refused
@@ -134,65 +174,94 @@ def upload_object():
       'size'      size to record, if it differs from the uploaded size
                   (defaults to the uploaded size)
 
-    201 with the new object's metadata. 400 for a bad field or a checksum
-    mismatch (nothing is stored), 409 if an object from this path exists,
-    503 if there is not enough space on enough live nodes to store every
-    chunk twice.
+    201 with the new object's metadata. 400 for a bad field, a checksum
+    mismatch or an upload that stopped before its end (nothing is stored),
+    409 if an object from this path exists, 503 if there is not enough space
+    on enough live nodes to store every chunk twice, or if MAX_TRANSFERS
+    uploads and downloads are already running.
     """
-    file = request.files.get("file")
-    if file is None or not file.filename:
-        return error("Missing 'file' field in the multipart upload", 400)
+    if request.mimetype == "multipart/form-data":
+        file = request.files.get("file")
+        if file is None or not file.filename:
+            return error("Missing 'file' field in the multipart upload", 400)
+        return store_upload(request.form, file.stream, file.filename, file.mimetype)
 
-    data = file.read()
-    name = os.path.basename(file.filename.replace("\\", "/"))
+    if "name" in request.args:
+        response = store_upload(request.args, request.stream, request.args["name"], request.mimetype)
+        if response[1] >= 400:
+            discard_body()
+        return response
 
-    # Check A (client -> server): if the client sent a checksum, the bytes that
-    # arrived must match it. Reject before storing anything.
-    expected = request.form.get("checksum")
-    if expected and not verify(data, expected):
-        return error("Checksum mismatch: the upload was damaged in transit", 400)
+    return error("Missing 'file' field in the multipart upload (or 'name' in the query string "
+                 "for a raw upload)", 400)
+
+
+def store_upload(fields, stream, filename: str, content_type: str):
+    """The part of an upload shared by both ways of sending it: check the
+    fields, then let the distributor store the stream chunk by chunk."""
+    name = os.path.basename(filename.replace("\\", "/"))
+    if not name:
+        return error("The file name must not be empty", 400)
 
     # content type: what the client said, else guessed from the file name
-    content_type = file.mimetype
     if not content_type or content_type == DEFAULT_CONTENT_TYPE:
         content_type = mimetypes.guess_type(name)[0] or DEFAULT_CONTENT_TYPE
 
     try:
         custom = {}
-        if request.form.get("metadata"):
+        if fields.get("metadata"):
             try:
-                raw = json.loads(request.form["metadata"])
+                raw = json.loads(fields["metadata"])
             except ValueError:
                 raise ValueError("'metadata' must be valid JSON")
             custom = {k: v for k, v in parse_custom(raw, "'metadata'").items() if v is not None}
 
         size = None
-        if request.form.get("size"):
+        if fields.get("size"):
             try:
-                size = int(request.form["size"])
+                size = int(fields["size"])
             except ValueError:
                 raise ValueError("'size' must be an integer")
             if size < 0:
                 raise ValueError("'size' must not be negative")
 
-        client_id = (request.form.get("client_id") or "").strip()
+        client_id = (fields.get("client_id") or "").strip()
         if len(client_id) > MAX_CLIENT_ID_LENGTH:
             raise ValueError(f"'client_id' must be at most {MAX_CLIENT_ID_LENGTH} characters")
     except ValueError as e:
         return error(str(e), 400)
 
+    if not transfers.take():
+        return busy()
     try:
         object_id = distributor.upload(
-            name, data, content_type=content_type, custom=custom,
-            source_path=request.form.get("path") or None, size=size,
-            client_id=client_id or None,
+            name, stream, content_type=content_type, custom=custom,
+            source_path=fields.get("path") or None, size=size,
+            client_id=client_id or None, checksum=fields.get("checksum") or None,
         )
     except FileExistsError as e:
         return error(str(e), 409)
+    except ChecksumMismatch as e:
+        return error(str(e), 400)
     except RuntimeError as e:
         return error(str(e), 503)
+    finally:
+        transfers.give_back()
 
     return jsonify(object_json(distributor.get_object(object_id))), 201
+
+
+def discard_body() -> None:
+    """Read and drop what is left of a raw upload's body. A client sends the
+    whole body before it reads the answer, so without this a refused upload
+    (409, 503, ...) would look like a broken connection to it instead of
+    showing the error."""
+    try:
+        while request.stream.read(CHUNK_SIZE):
+            pass
+    except Exception:
+        pass   # the client went away: nobody is waiting for the answer
+
 
 
 @app.route("/api/v1/objects", methods=["GET"])
@@ -228,21 +297,62 @@ def list_objects():
 
 @app.route("/api/v1/objects/<object_id>", methods=["GET"])
 def download_object(object_id):
-    """Send the object's bytes back with its content type, and their checksum
-    in the 'X-Checksum' header so the client can verify them.
-    404 if there is no such object, 503 if no good copy of a chunk is left.
+    """Send the object's bytes, one chunk at a time as each is read from a
+    worker, so the controller never holds the whole object in memory.
+    Headers: its Content-Type, Content-Length, and X-Checksum, the checksum
+    recorded at upload, so the client can verify what it received.
+
+    404 if there is no such object. 503 if some chunk has no copy on a live
+    worker or the first chunk has no good copy (both found before anything
+    is sent), or if MAX_TRANSFERS uploads and downloads are already running.
+    If a later chunk turns out to have no good copy (e.g. both copies damaged
+    on disk), the connection is closed before Content-Length bytes were
+    sent: the client sees the download is incomplete and must not keep it.
     """
+    if not transfers.take():
+        return busy()
     try:
-        meta = distributor.get_object(object_id)
-        data = distributor.download(object_id)
+        meta, chunks = distributor.stream_object(object_id)
     except KeyError:
+        transfers.give_back()
         return error(f"No object with id '{object_id}'", 404)
     except RuntimeError as e:
+        transfers.give_back()
         return error(str(e), 503)
+    except BaseException:
+        transfers.give_back()
+        raise
 
-    response = send_file(io.BytesIO(data), mimetype=meta.content_type)
-    response.headers["X-Checksum"] = compute(data)
+    finished = threading.Lock()
+
+    def finish():
+        """End the download (a delete waiting for it can go ahead) and free its
+        slot. Once only: it is called both when the response is closed and
+        when the body stops, whichever comes first."""
+        if finished.acquire(blocking=False):
+            chunks.close()
+            transfers.give_back()
+
+    def body():
+        try:
+            yield from chunks
+        except Exception as e:
+            print(f"[download] '{meta.name}' (object_id={object_id}) stopped part-way: {e}; "
+                  "closing the connection")
+            raise
+        finally:
+            # also runs when the client went away part-way (the server then
+            # drops this generator), even if the server never closes the response
+            finish()
+
+    response = Response(body(), mimetype=meta.content_type)
+    sizes = [c.size for c in meta.chunks]
+    if None not in sizes:                # unknown only for objects stored before sizes were kept
+        response.headers["Content-Length"] = str(sum(sizes))
+    response.headers["X-Checksum"] = meta.checksum
+    response.call_on_close(finish)       # finished, or never started (e.g. a HEAD request)
     return response
+
 
 
 @app.route("/api/v1/objects/<object_id>/metadata", methods=["GET"])
