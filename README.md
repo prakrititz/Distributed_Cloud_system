@@ -58,11 +58,14 @@ tests/                                     the test suite (needs no Docker)
 
 ## How it works
 
-**Upload:** the file is read `CHUNK_SIZE` bytes at a time. Each chunk gets
-`REPLICATION_FACTOR` copies on different live workers with room, and only then
-is the next chunk read, so the controller holds about one chunk, never the whole
-file. The checksum of the whole file is built up as the chunks go by and
-compared with the client's at the end. The name and metadata are registered (and
+**Upload:** the file is read `CHUNK_SIZE` bytes at a time, in order. Each chunk
+gets `REPLICATION_FACTOR` copies on different live workers with room, written at
+the same time, and up to `PARALLEL_CHUNKS` chunks (default 4) are being stored
+at once; reading waits while all of them are busy, so the controller holds about
+`PARALLEL_CHUNKS` chunks, never the whole file. The workers for each chunk are
+chosen in reading order, so placement is the same as one chunk at a time. The
+checksum of the whole file is built up as the chunks are read, so in their real
+order however they finish, and compared with the client's at the end. The name and metadata are registered (and
 saved) only after every copy of every chunk is stored and the checksum matches.
 If anything fails (a copy cannot be stored: 503; the checksum is wrong: 400; the
 client stops sending), every copy already written is deleted, so nothing
@@ -86,7 +89,9 @@ worker that turns out to be dead or full is skipped and the next one is tried.
 
 **Download:** streamed too: each chunk is read from the first copy that is up
 and intact (checked against the checksum recorded at upload, falling back to
-the other copy), sent, and dropped before the next. The response carries
+the other copy), sent, and dropped. While one chunk is being sent, the next
+ones (up to `PARALLEL_CHUNKS`) are already being fetched, but they are sent
+strictly in order. The response carries
 `Content-Length` and `X-Checksum` (the checksum recorded at upload). Before
 anything is sent, the controller checks that every chunk has a copy on a live
 worker and reads the first chunk, so the usual failures are a clear 503. If a
@@ -107,7 +112,7 @@ leaves those copies alone meanwhile.
 
 **Transfers at once:** at most `MAX_TRANSFERS` uploads and downloads run at the
 same time (503 with `Retry-After: 1` beyond that), so the controller's memory
-stays bounded: about one chunk per transfer.
+stays bounded: about `PARALLEL_CHUNKS` chunks per transfer.
 
 **Health:** `GET /api/v1/replication` reports each chunk as `healthy`,
 `under_replicated` (still downloadable) or `unavailable`, and each copy as `ok`,
@@ -224,6 +229,7 @@ In Docker they are at the top of `docker-compose.yml` (see [GUIDE.md](GUIDE.md))
 | `CHUNK_SIZE` | 1048576 | controller | bytes per chunk |
 | `REPLICATION_FACTOR` | 2 | controller | copies of every chunk |
 | `MAX_TRANSFERS` | 32 | controller | uploads and downloads at once; more get 503 |
+| `PARALLEL_CHUNKS` | 4 | controller | chunks moving at once within one upload or download (memory: about this many chunks per transfer) |
 | `WORKER_CAPACITY` (`CAPACITY`) | 5242880 | worker | bytes a worker may store |
 | `WORKER_NAME` | worker | worker | prefix of the worker ids |
 | `API_PORT` (`PORT`) | 5000 | controller | the API's port |
@@ -254,7 +260,8 @@ python -m pytest tests -m "not cluster"   # only the fast tests that start no se
 | `test_cleanup.py` | orphans and missing chunks, cleanup, uploads in progress left alone |
 | `test_multi_client.py` | several clients at once: same paths, races, parallel patches and deletes |
 | `test_client.py` | the client: menu, commands, original bytes on download |
-| `test_streaming.py` | streamed uploads and downloads: one chunk at a time, raw uploads, checksum at the end, uploads and downloads cut off half-way, delete during a download, `MAX_TRANSFERS`, a 50 MB file in a few MB of memory |
+| `test_parallel.py` | several chunks in flight: copies written at the same time, at most `PARALLEL_CHUNKS` at once, chunks finishing out of order, a failure or bad checksum with chunks in flight, downloads fetched ahead but sent in order, an abandoned download fetching nothing more |
+| `test_streaming.py` | streamed uploads and downloads: a bounded number of chunks at a time, raw uploads, checksum at the end, uploads and downloads cut off half-way, delete during a download, `MAX_TRANSFERS`, a 50 MB file in a few MB of memory |
 | `test_registration.py` | workers registering and re-registering, more workers joining, finding the id in Docker |
 | `test_docker_files.py` | each image's allowlist starts its program, the settings work, the compose file and Dockerfiles say what the spec requires |
 
@@ -278,6 +285,33 @@ request it reads the rest of the connection into a fresh 10 MB buffer.
 `tests/test_streaming.py` checks that a 50 MB file passes through the client and
 the controller together in under 10 MB (about 3 MB up and 5 MB down; it was 200
 MB up and 100 MB down before).
+
+## Speed
+
+Within one upload or download, `PARALLEL_CHUNKS` chunks move at once (a chunk's
+copies are written at the same time; a download fetches ahead). One client,
+100 MB file, local cluster with 4 workers:
+
+| `PARALLEL_CHUNKS` | Upload | Download | Extra controller memory |
+|---|---|---|---|
+| before (one chunk after another) | 15 MB/s | 37 MB/s | +20 / +3 MB |
+| 1 (only the copies at once) | 25 MB/s | 40 MB/s | +11 MB |
+| 2 | 53 MB/s | 76 MB/s | +5 to 8 MB |
+| **4 (default)** | **115 MB/s** | **173 MB/s** | +6 to 7 MB |
+| 8 | 159 MB/s | 207 MB/s | +10 to 15 MB |
+
+Several clients at once (20 MB each, total throughput):
+
+| Clients | Upload before | Upload now | Download before | Download now |
+|---|---|---|---|---|
+| 1 | 18 MB/s | 60 MB/s | 42 MB/s | 163 MB/s |
+| 2 | 31 MB/s | 155 MB/s | 71 MB/s | 200 MB/s |
+| 4 | 63 MB/s | 162 MB/s | 205 MB/s | 205 MB/s |
+| 8 | 121 MB/s | 171 MB/s | 239 MB/s | 205 MB/s |
+
+With several clients the total now levels off around 170 MB/s up and 205 MB/s
+down: everything (clients, controller, workers, one disk) runs on one machine,
+and every byte passes through the one controller.
 
 ## Limitations
 

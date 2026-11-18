@@ -60,6 +60,12 @@ REPLICATION_FACTOR = _int_setting("REPLICATION_FACTOR", 2)  # copies of every ch
 # (more are refused with 503, "try again"), so the controller's memory use
 # stays bounded however many clients there are.
 MAX_TRANSFERS = _int_setting("MAX_TRANSFERS", 32)
+# Within one upload or download, this many chunks move at once: an upload
+# writes the copies of several chunks at the same time, a download fetches the
+# next chunks while sending the current one. Each holds one chunk in memory,
+# so a transfer needs about PARALLEL_CHUNKS chunks of memory. 1 = one chunk
+# at a time (a chunk's copies are still written at the same time).
+PARALLEL_CHUNKS = _int_setting("PARALLEL_CHUNKS", 4)
 
 # Where the controller saves its metadata, so a restart keeps every object.
 # Empty ("") keeps it only in memory.

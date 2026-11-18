@@ -95,8 +95,9 @@ def count_fetches(nodes) -> list:
 # the distributor, with in-memory nodes
 # ---------------------------------------------------------------------------
 class TestStreamingUpload:
-    def test_each_chunk_is_stored_before_the_next_is_read(self, make_distributor):
-        d, nodes = make_distributor(chunk_size=100)
+    @pytest.mark.parametrize("parallel", [1, 4])
+    def test_reading_never_runs_more_than_parallel_chunks_ahead(self, make_distributor, parallel):
+        d, nodes = make_distributor(chunk_size=100, parallel_chunks=parallel)
         data = os.urandom(1000)
         stream = Recorder(data)
         read_when_stored = {}
@@ -104,8 +105,10 @@ class TestStreamingUpload:
             n.on_store = lambda chunk_id: read_when_stored.setdefault(chunk_id, stream.pos)
         oid = d.upload("f", stream)
         for info in d.get_object(oid).chunks:
-            # when a chunk's first copy was stored, nothing after it had been read
-            assert read_when_stored[info.chunk_id] <= (info.index + 1) * 100
+            # when a chunk's first copy was stored, at most `parallel` chunks
+            # had been read from the stream (this one and the ones in flight);
+            # with 1, nothing after it had been read
+            assert read_when_stored[info.chunk_id] <= (info.index + parallel) * 100
         assert d.download(oid) == data
 
     def test_short_reads_still_give_full_chunks(self, make_distributor):
@@ -160,20 +163,22 @@ class TestStreamingUpload:
 
 
 class TestStreamingDownload:
-    def test_chunks_are_fetched_one_at_a_time_as_they_are_asked_for(self, make_distributor):
-        d, nodes = make_distributor(chunk_size=100)
-        data = os.urandom(400)
+    @pytest.mark.parametrize("parallel", [1, 3])
+    def test_chunks_are_fetched_at_most_parallel_chunks_ahead(self, make_distributor, parallel):
+        d, nodes = make_distributor(chunk_size=100, parallel_chunks=parallel)
+        data = os.urandom(1000)                                   # 10 chunks
         oid = d.upload("f", data)
         fetched = count_fetches(nodes)
         meta, chunks = d.stream_object(oid)
         assert len(fetched) == 1                                  # only the first chunk, before anything is sent
-        got = [next(chunks)]
-        for i in range(2, 5):
+        got = []
+        for i in range(1, 11):
             got.append(next(chunks))
-            assert len(fetched) == i
+            time.sleep(0.02)                                      # let the fetchers run
+            assert len(fetched) <= min(10, i + parallel)          # never more than `parallel` ahead
         with pytest.raises(StopIteration):
             next(chunks)
-        assert b"".join(got) == data and not d._reading
+        assert b"".join(got) == data and len(fetched) == 10 and not d._reading
 
     def test_a_chunk_with_no_live_copy_fails_before_anything_is_sent(self, make_distributor):
         d, nodes = make_distributor(chunk_size=100)

@@ -18,7 +18,10 @@ Workers join by registering (register_node), so their number is not fixed.
 
 Uploads and downloads are streamed: the data passes through one chunk at a
 time, so the controller never holds a whole object in memory, whatever its
-size (see upload and stream_object).
+size (see upload and stream_object). Within one transfer, a few chunks
+(parallel_chunks) are moving at once: an upload writes the copies of several
+chunks at the same time, a download fetches the next chunks while sending the
+current one. The data is still read, checksummed and sent in order.
 
 The nodes it is given are RemoteNode objects (controller/remote_node.py): every call on
 them is an HTTP request to that node's server. The distributor only relies on
@@ -30,11 +33,13 @@ import io
 import threading
 import time
 import uuid
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from config import HEARTBEAT_TIMEOUT
+from config import HEARTBEAT_TIMEOUT, PARALLEL_CHUNKS
 from controller.metadata_store import MemoryStore
 from helpers.checksum import compute, matches, running, verify
 from helpers.errors import ChecksumMismatch, ChunkCorrupt, NodeUnavailable
@@ -155,7 +160,8 @@ class ChunkStream:
 class Distributor:
     def __init__(self, nodes: list, chunk_size: int = CHUNK_SIZE,
                  replication_factor: int = REPLICATION_FACTOR,
-                 heartbeat_timeout: float = HEARTBEAT_TIMEOUT, store=None):
+                 heartbeat_timeout: float = HEARTBEAT_TIMEOUT, store=None,
+                 parallel_chunks: int = PARALLEL_CHUNKS):
         # The node registry: a list of RemoteNode. Workers are added while the
         # system runs (register_node), so the list is never changed in place:
         # a new list replaces it, and a request already looping over the old
@@ -169,6 +175,13 @@ class Distributor:
         self._status = {}
         self._status_lock = threading.Lock()
         self.chunk_size = chunk_size   # a parameter so we can test with tiny chunks
+        # How many chunks of one upload or download are moving at once. Each
+        # holds one chunk in memory, so this also bounds a transfer's memory.
+        self.parallel_chunks = max(1, parallel_chunks)
+        # Choosing nodes reads and updates the cached free space and the pair
+        # counts: one choice at a time, so two chunks in flight never both
+        # count on the same free space.
+        self._place_lock = threading.Lock()
         self.replication_factor = replication_factor
         self.metadata = {}             # object_id -> ObjectMetadata
         self.paths = {}                # (client_id, source_path) -> object_id (duplicate check)
@@ -362,13 +375,36 @@ class Distributor:
         candidates.sort(key=lambda c: c[:3])
         return [c[3] for c in candidates[:count]]
 
-    def _note_copies(self, node_ids) -> None:
-        """These nodes now hold copies of the same chunk: count each pair."""
+    def _note_copies(self, node_ids, sign: int = 1) -> None:
+        """These nodes now hold copies of the same chunk: count each pair
+        (sign=-1 takes a count back, when planned copies change)."""
         ids = list(node_ids)
         with self._status_lock:
             for a in range(len(ids)):
                 for b in range(a + 1, len(ids)):
-                    self._pair_use[frozenset((ids[a], ids[b]))] += 1
+                    self._pair_use[frozenset((ids[a], ids[b]))] += sign
+
+    def _choose(self, size: int, count: int, exclude=(), holders=(), what: str = "a chunk") -> list:
+        """Choose `count` more nodes for a chunk of `size` bytes, one at a time
+        (each choice counts the earlier ones as partners, so copies spread
+        over worker pairs), and reserve the space on them at once, so the
+        next chunk in flight sees it as taken. Raises RuntimeError if there
+        are not enough live nodes with room."""
+        with self._place_lock:
+            chosen = []
+            for _ in range(count):
+                taken = set(exclude) | set(holders) | {n.node_id for n in chosen}
+                picked = self._pick_nodes(size, 1, exclude=taken,
+                                          partners=list(holders) + [n.node_id for n in chosen])
+                if picked is None:
+                    for node in chosen:                       # give the space back
+                        self._reserve(node.node_id, -size)
+                    raise RuntimeError(
+                        f"Not enough storage: need {self.replication_factor} different "
+                        f"live nodes with room for {what}")
+                self._reserve(picked[0].node_id, size)
+                chosen.append(picked[0])
+            return chosen
 
     def _get_node(self, node_id: str):
         """Find a registered node by its id. Raises KeyError if unknown."""
@@ -411,8 +447,10 @@ class Distributor:
 
         data         the object: bytes, or a binary file-like object (an open
                      file, the body of an HTTP request). It is read one chunk
-                     at a time and each chunk is stored before the next is
-                     read, so only about one chunk is ever in memory.
+                     at a time, in order. Up to parallel_chunks chunks are
+                     being stored at once (their copies written at the same
+                     time); reading waits while all of them are busy, so only
+                     about parallel_chunks chunks are ever in memory.
         name         file name, kept as metadata (several objects can share it)
         content_type e.g. 'video/mp4'
         custom       user-defined key-value metadata
@@ -427,17 +465,18 @@ class Distributor:
                      uploaded (e.g. the client wraps the file in a header);
                      defaults to the number of bytes uploaded
         checksum     the client's checksum of the whole object (optional). The
-                     checksum of what arrived is built up chunk by chunk and
-                     compared at the end; on a mismatch everything stored is
-                     deleted and ChecksumMismatch is raised.
+                     checksum of what arrived is built up chunk by chunk, in
+                     reading order, and compared at the end; on a mismatch
+                     everything stored is deleted and ChecksumMismatch is raised.
 
         The object_id is generated here, used to name the chunks, and only
         becomes visible (metadata and path index) once ALL copies of ALL
         chunks are stored and the checksum matches. If anything fails (a copy
         cannot be stored, the data stops arriving, the checksum is wrong),
-        every copy already written is deleted and the error is raised again,
-        so nothing half-uploaded is left behind. (Strict: no chunk is ever
-        stored with fewer copies than the replication factor.)
+        the chunks still being stored are waited for, every copy written is
+        deleted and the error is raised again, so nothing half-uploaded is
+        left behind. (Strict: no chunk is ever stored with fewer copies than
+        the replication factor.)
 
         Raises FileExistsError if this client already has an object from this
         source_path, RuntimeError if there is not enough room on enough live
@@ -452,69 +491,53 @@ class Distributor:
         object_id = str(uuid.uuid4())
         whole = running()   # checksum of the whole object, built up chunk by chunk
         received = 0        # bytes read so far
-        print(f"[upload] '{name}': storing, {self.replication_factor} copies of every chunk")
+        print(f"[upload] '{name}': storing, {self.replication_factor} copies of every chunk, "
+              f"up to {self.parallel_chunks} chunks at once")
 
-        # Two lists, two jobs. Both are filled in the loop below.
+        # Two lists, two jobs. Both are filled while the chunks are stored.
         #
         # written: "what must I undo if this upload fails?"
         #   One (chunk_id, node) entry per physical COPY stored on a node
         #   (2 per chunk with replication factor 2). Holds node objects
-        #   because _rollback calls node.delete_chunk() on them. Only
-        #   _rollback reads it.
+        #   because _rollback calls node.delete_chunk() on them. Chunks are
+        #   stored by several threads, so it is guarded by a lock.
         #
         # placed: "what do I record in the metadata?"
         #   One ChunkInfo per CHUNK, listing the node ids of its copies.
-        #   Only added once every copy of that chunk is stored. Only the
-        #   ObjectMetadata built at the end reads it; if the upload fails
-        #   it is simply thrown away.
+        #   Chunks can finish in any order; it is sorted by index at the end.
         written = []
+        written_lock = threading.Lock()
         placed = []
         self._in_flight.add(object_id)
         try:
-            # One chunk at a time: read it, store its copies, forget it.
-            for index, chunk in enumerate(self._read_chunks(data)):
-                chunk_id = f"{object_id}-{index}"
-                whole.update(chunk)
-                received += len(chunk)
-                chunk_checksum = compute(chunk)   # every copy must match it when read back
-                self._rotation += 1        # equal nodes take turns, chunk by chunk
-
-                # Place the copies one at a time. Placement uses what the nodes
-                # last reported, which can be a moment old, so a chosen node may
-                # turn out to be dead or full: then it is skipped (and a dead
-                # one is marked down) and the next best node is tried. The
-                # upload fails only when there are not enough nodes left.
-                targets = []   # nodes that now hold a copy of this chunk
-                tried = set()  # nodes that failed for this chunk
-                while len(targets) < self.replication_factor:
-                    holders = [n.node_id for n in targets]
-                    picked = self._pick_nodes(len(chunk), 1, exclude=tried | set(holders),
-                                              partners=holders)
-                    if picked is None:
-                        raise RuntimeError(
-                            f"Not enough storage: need {self.replication_factor} different "
-                            f"live nodes with room for chunk {index}"
-                        )
-                    node = picked[0]
-                    try:
-                        stored = node.store_chunk(chunk_id, chunk, checksum=chunk_checksum)
-                    except NodeUnavailable:
-                        self._mark_down(node.node_id)
-                        stored = False
-                    except ChunkCorrupt:
-                        stored = False   # the chunk arrived damaged
-                    if not stored:
-                        tried.add(node.node_id)
-                        continue
-                    self._reserve(node.node_id, len(chunk))
-                    written.append((chunk_id, node))   # remember this copy for rollback
-                    targets.append(node)
-
-                replica_ids = [n.node_id for n in targets]
-                self._note_copies(replica_ids)
-                print(f"[upload] chunk {index} ({len(chunk)} bytes) -> {', '.join(replica_ids)}")
-                # all copies stored: record the chunk
-                placed.append(ChunkInfo(chunk_id, index, replica_ids, chunk_checksum, len(chunk)))
+            # The chunks' copies are written by the threads of this pool; the
+            # last copy of each chunk is written by the chunk's own thread.
+            # Leaving the with block waits for the chunk threads first (they
+            # may still hand copies to the pool), then for the copy pool.
+            copies = ThreadPoolExecutor(self.parallel_chunks * max(1, self.replication_factor - 1),
+                                        thread_name_prefix="copy")
+            with copies, ThreadPoolExecutor(self.parallel_chunks, thread_name_prefix="chunk") as chunk_pool:
+                in_flight = set()
+                # Read in order, one chunk at a time. The whole-object
+                # checksum is fed here, at reading time, so it sees the bytes
+                # in their real order however the chunks finish.
+                for index, chunk in enumerate(self._read_chunks(data)):
+                    whole.update(chunk)
+                    received += len(chunk)
+                    self._rotation += 1        # equal nodes take turns, chunk by chunk
+                    # Choosing the nodes is done here, in order, so placement
+                    # is the same as if the chunks went one after another.
+                    planned = self._choose(len(chunk), self.replication_factor, what=f"chunk {index}")
+                    self._note_copies([n.node_id for n in planned])
+                    in_flight.add(chunk_pool.submit(
+                        self._store_chunk, object_id, index, chunk, planned, copies, written, written_lock))
+                    chunk = None               # the task holds it; do not keep a second reference
+                    if len(in_flight) >= self.parallel_chunks:
+                        done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+                        placed.extend(f.result() for f in done)   # a failed chunk raises here
+                for f in in_flight:
+                    placed.append(f.result())
+            placed.sort(key=lambda c: c.index)
 
             # Every chunk is stored. Now that all of it has gone by, the
             # checksum of the whole object is known: compare it with the
@@ -550,7 +573,8 @@ class Distributor:
         except BaseException as e:
             # Whatever went wrong (no space, a node died, the client went
             # away, a bad checksum, a bug), never leave copies behind that no
-            # metadata points to.
+            # metadata points to. (Leaving the `with` above already waited for
+            # every chunk still being stored, so `written` is complete.)
             print(f"[upload] '{name}' failed ({type(e).__name__}: {e}); "
                   f"rolling back {len(written)} copy/copies")
             with self._lock:
@@ -565,6 +589,66 @@ class Distributor:
 
         print(f"[upload] done, '{name}': {received} bytes in {len(placed)} chunk(s) -> object_id={object_id}")
         return object_id
+
+    def _store_chunk(self, object_id: str, index: int, chunk: bytes, planned: list,
+                     copies: ThreadPoolExecutor, written: list, written_lock) -> "ChunkInfo":
+        """Store one chunk's copies on the planned nodes, all at the same time,
+        and return its ChunkInfo. Runs on one of the upload's chunk threads.
+
+        A planned node that turns out to be dead, full or to receive the chunk
+        damaged is skipped (a dead one is marked down) and a replacement is
+        chosen, until the chunk has replication_factor copies. Raises
+        RuntimeError when there are not enough nodes left. Every copy stored
+        is added to `written`, so the upload can roll it back."""
+        chunk_id = f"{object_id}-{index}"
+        chunk_checksum = compute(chunk)   # every copy must match it when read back
+        size = len(chunk)
+        targets = []                      # nodes that now hold a copy
+        tried = set()                     # nodes that failed for this chunk
+        attempt = list(planned)
+        try:
+            while True:
+                # The extra copies go to the pool; the last one is written by
+                # this thread meanwhile, and only then are the others waited for.
+                others = [copies.submit(self._store_copy, node, chunk_id, chunk, chunk_checksum)
+                          for node in attempt[:-1]]
+                mine = self._store_copy(attempt[-1], chunk_id, chunk, chunk_checksum)
+                results = [f.result() for f in others] + [mine]
+                for node, stored in zip(attempt, results):
+                    if stored:
+                        with written_lock:
+                            written.append((chunk_id, node))   # remember this copy for rollback
+                        targets.append(node)
+                    else:
+                        tried.add(node.node_id)
+                        self._reserve(node.node_id, -size)       # it did not take the space
+                if len(targets) >= self.replication_factor:
+                    break
+                attempt = self._choose(size, self.replication_factor - len(targets), exclude=tried,
+                                       holders=[n.node_id for n in targets], what=f"chunk {index}")
+        finally:
+            planned_ids = [n.node_id for n in planned]
+            final_ids = [n.node_id for n in targets]
+            if sorted(planned_ids) != sorted(final_ids):          # the pair counts follow the real copies
+                self._note_copies(planned_ids, -1)
+                if len(final_ids) >= self.replication_factor:
+                    self._note_copies(final_ids)
+
+        replica_ids = [n.node_id for n in targets]
+        print(f"[upload] chunk {index} ({size} bytes) -> {', '.join(replica_ids)}")
+        return ChunkInfo(chunk_id, index, replica_ids, chunk_checksum, size)
+
+    def _store_copy(self, node, chunk_id: str, chunk: bytes, chunk_checksum: str) -> bool:
+        """Write one copy. True if stored; False if the node is dead (it is
+        marked down), full, or says the chunk arrived damaged."""
+        try:
+            return bool(node.store_chunk(chunk_id, chunk, checksum=chunk_checksum))
+        except NodeUnavailable:
+            self._mark_down(node.node_id)
+            return False
+        except ChunkCorrupt:
+            return False   # the chunk arrived damaged
+
 
     def stream_object(self, object_id: str):
         """Start a download: returns (metadata, chunks), where chunks is an
@@ -621,17 +705,42 @@ class Distributor:
 
     def _chunks_from(self, meta: ObjectMetadata, chunks: list, first: bytes):
         """The iterator behind stream_object: the first chunk (already
-        fetched), then each later one as it is asked for."""
+        fetched), then each later one in order. While one chunk is being
+        sent, the next ones (up to parallel_chunks) are already being fetched
+        on other threads; they are still given out strictly in index order,
+        and the whole-object checksum is fed in that order. If a chunk fails,
+        the error is raised when its turn comes, after the earlier chunks."""
         whole = running()
-        whole.update(first)
-        yield first
-        first = None                             # do not keep it for the rest of the download
-        for info in chunks[1:]:
-            data = self._fetch_chunk(info)
-            whole.update(data)
-            yield data
-        if not matches(whole.hexdigest(), meta.checksum):
-            raise RuntimeError(f"Object '{meta.object_id}' failed the whole-object checksum")
+        ahead = deque()                   # futures of the next chunks, in index order
+        pool = ThreadPoolExecutor(self.parallel_chunks, thread_name_prefix="fetch") if len(chunks) > 1 else None
+        upcoming = iter(chunks[1:])
+
+        def fetch_ahead():
+            while pool is not None and len(ahead) < self.parallel_chunks:
+                info = next(upcoming, None)
+                if info is None:
+                    return
+                ahead.append(pool.submit(self._fetch_chunk, info))
+
+        try:
+            fetch_ahead()
+            whole.update(first)
+            yield first
+            first = None                  # do not keep it for the rest of the download
+            while ahead:
+                data = ahead.popleft().result()   # this chunk's turn; raises if it failed
+                fetch_ahead()
+                whole.update(data)
+                yield data
+            if not matches(whole.hexdigest(), meta.checksum):
+                raise RuntimeError(f"Object '{meta.object_id}' failed the whole-object checksum")
+        finally:
+            # finished, failed or abandoned: fetch nothing more
+            if pool is not None:
+                for f in ahead:
+                    f.cancel()
+                pool.shutdown(wait=False)
+
 
     def _need_live_copy(self, info: ChunkInfo) -> None:
         """Raise RuntimeError if no node that holds a copy of this chunk is up.
