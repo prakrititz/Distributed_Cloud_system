@@ -52,8 +52,10 @@ class FakeNode:
     def alive(self) -> bool:
         return not self.down
 
-    def store_chunk(self, chunk_id: str, data: bytes) -> bool:
+    def store_chunk(self, chunk_id: str, data: bytes, checksum: str = None) -> bool:
         self.store_calls.append(chunk_id)
+        if checksum is not None and checksum != compute(data):
+            raise ChunkCorrupt(f"{self.node_id} received chunk '{chunk_id}' damaged in transit")
         self._up()
         if self.refuse_writes:
             raise ChunkCorrupt(f"{self.node_id} received chunk '{chunk_id}' damaged in transit")
