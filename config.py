@@ -76,9 +76,10 @@ PARALLEL_CHUNKS = _int_setting("PARALLEL_CHUNKS", 4)
 WORKER_CONNECTIONS = _int_setting("WORKER_CONNECTIONS", 32)
 WORKER_THREADS = _int_setting("WORKER_THREADS", 32)
 
-# Where the controller saves its metadata, so a restart keeps every object.
-# Empty ("") keeps it only in memory.
-METADATA_PATH = os.environ.get("METADATA_PATH", "./data/controller/metadata.json").strip()
+# Where the controller saves its metadata, so a restart keeps every object:
+# a SQLite database file (a path ending in .json uses the older JSON file
+# instead). Empty ("") keeps it only in memory.
+METADATA_PATH = os.environ.get("METADATA_PATH", "./data/controller/metadata.db").strip()
 
 # Automatic repair: a worker that has been down this many seconds triggers a
 # repair (a quick restart within that time causes no copying). 0 turns it off.
