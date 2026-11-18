@@ -67,6 +67,15 @@ MAX_TRANSFERS = _int_setting("MAX_TRANSFERS", 32)
 # at a time (a chunk's copies are still written at the same time).
 PARALLEL_CHUNKS = _int_setting("PARALLEL_CHUNKS", 4)
 
+# Connections. The controller keeps a pool of open connections to each worker
+# and reuses them (HTTP keep-alive) instead of opening a new connection for
+# every request; WORKER_CONNECTIONS is how many it keeps open per worker (a
+# burst beyond that opens extra connections that are closed after use).
+# Each worker answers with WORKER_THREADS threads (waitress), so that many
+# requests to one worker are handled at the same time.
+WORKER_CONNECTIONS = _int_setting("WORKER_CONNECTIONS", 32)
+WORKER_THREADS = _int_setting("WORKER_THREADS", 32)
+
 # Where the controller saves its metadata, so a restart keeps every object.
 # Empty ("") keeps it only in memory.
 METADATA_PATH = os.environ.get("METADATA_PATH", "./data/controller/metadata.json").strip()

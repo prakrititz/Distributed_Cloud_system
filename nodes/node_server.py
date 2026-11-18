@@ -25,9 +25,14 @@ Settings (environment variables):
                       (default: worked out from HOST/PORT, or the container name)
   CONTROLLER_URL      where it registers and sends heartbeats
   HEARTBEAT_INTERVAL  seconds between heartbeats (default 2)
+  WORKER_THREADS      requests it answers at the same time (default 32)
 
 The controller talks to it only through the endpoints below, never by
 importing it. Workers never talk to each other.
+
+It is served by waitress, a production web server (not Flask's development
+server): it keeps connections open between requests (HTTP keep-alive), so
+the controller can reuse them, and answers with a fixed pool of threads.
 """
 import os
 import threading
@@ -35,9 +40,11 @@ import time
 
 import requests
 from flask import Flask, Response, request, jsonify
+from waitress.server import create_server
 
 from config import HEARTBEAT_INTERVAL as DEFAULT_HEARTBEAT_INTERVAL
 from config import CONTROLLER_URL as DEFAULT_CONTROLLER_URL
+from config import WORKER_THREADS
 from helpers.checksum import compute, verify
 from helpers.errors import ChunkCorrupt
 from nodes import identity
@@ -234,5 +241,14 @@ def send_heartbeats() -> None:
 if __name__ == "__main__":
     print(f"[{NODE_ID}] listening on {HOST}:{PORT} (reachable as {ADVERTISE_URL}), "
           f"data in {DATA_DIR}, capacity {CAPACITY} bytes")
+    # waitress, not app.run(): connections stay open for the controller to
+    # reuse, and WORKER_THREADS requests are answered at once. A connection
+    # idle for 120 s is closed (the controller then opens a new one).
+    # Order matters: create_server already listens on the port, and only then
+    # does the heartbeat thread register with the controller, so the
+    # controller never hears "alive" from a worker that cannot be reached yet.
+    server = create_server(app, host=HOST, port=PORT, threads=WORKER_THREADS,
+                           connection_limit=max(100, 4 * WORKER_THREADS), channel_timeout=120,
+                           ident=NODE_ID)
     threading.Thread(target=send_heartbeats, daemon=True).start()
-    app.run(host=HOST, port=PORT)
+    server.run()
