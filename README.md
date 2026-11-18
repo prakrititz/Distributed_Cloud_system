@@ -49,7 +49,7 @@ tests/                                     the test suite (needs no Docker)
 | `controller/distributor.py` | Chunking, placement, metadata, reassembly, health report, repair, auto-repair, orphan detection |
 | `controller/remote_node.py` | `RemoteNode`: the controller's HTTP client for one worker |
 | `controller/metadata_store.py` | Saves the metadata to a JSON file atomically and loads it on start |
-| `nodes/node_server.py` | One worker as its own Flask process; registers itself and sends heartbeats |
+| `nodes/node_server.py` | One worker as its own Flask process, served by waitress; registers itself (once it is listening) and sends heartbeats |
 | `nodes/identity.py` | How a worker started by Docker Compose finds its own id (worker1, worker2, ...) |
 | `nodes/node.py` | `ChunkStore`: the worker's file-backed chunk storage, with checksums |
 | `helpers/checksum.py` | `compute` / `verify`: the one checksum function (SHA-256) used everywhere |
@@ -86,6 +86,14 @@ registers again if the controller has forgotten it (its heartbeat gets a 404).
 with its capacity and free space. A worker silent for 6 s is treated as down.
 Placement reads this table, so it sends no requests to the workers. A chosen
 worker that turns out to be dead or full is skipped and the next one is tried.
+
+**Connections:** the controller keeps a pool of open connections to each worker
+and reuses them (HTTP keep-alive); the workers run on waitress, a production web
+server that keeps connections open and answers with a fixed pool of threads. A
+worker opens its port before it registers, so it is never reported alive before
+it can be reached. The controller itself still runs on Flask's development
+server for now: waitress reads a whole request body before handing it over,
+which would stop raw uploads from reaching the workers while they arrive.
 
 **Download:** streamed too: each chunk is read from the first copy that is up
 and intact (checked against the checksum recorded at upload, falling back to
@@ -230,6 +238,8 @@ In Docker they are at the top of `docker-compose.yml` (see [GUIDE.md](GUIDE.md))
 | `REPLICATION_FACTOR` | 2 | controller | copies of every chunk |
 | `MAX_TRANSFERS` | 32 | controller | uploads and downloads at once; more get 503 |
 | `PARALLEL_CHUNKS` | 4 | controller | chunks moving at once within one upload or download (memory: about this many chunks per transfer) |
+| `WORKER_CONNECTIONS` | 32 | controller | open connections kept per worker and reused |
+| `WORKER_THREADS` | 32 | worker | requests a worker answers at the same time (waitress threads) |
 | `WORKER_CAPACITY` (`CAPACITY`) | 5242880 | worker | bytes a worker may store |
 | `WORKER_NAME` | worker | worker | prefix of the worker ids |
 | `API_PORT` (`PORT`) | 5000 | controller | the API's port |
@@ -260,6 +270,7 @@ python -m pytest tests -m "not cluster"   # only the fast tests that start no se
 | `test_cleanup.py` | orphans and missing chunks, cleanup, uploads in progress left alone |
 | `test_multi_client.py` | several clients at once: same paths, races, parallel patches and deletes |
 | `test_client.py` | the client: menu, commands, original bytes on download |
+| `test_connections.py` | reused connections: one connection for many requests to a worker, many threads sharing a pool, a dead worker still noticed and a restarted one reused, a worker usable as soon as it counts as alive |
 | `test_parallel.py` | several chunks in flight: copies written at the same time, at most `PARALLEL_CHUNKS` at once, chunks finishing out of order, a failure or bad checksum with chunks in flight, downloads fetched ahead but sent in order, an abandoned download fetching nothing more |
 | `test_streaming.py` | streamed uploads and downloads: a bounded number of chunks at a time, raw uploads, checksum at the end, uploads and downloads cut off half-way, delete during a download, `MAX_TRANSFERS`, a 50 MB file in a few MB of memory |
 | `test_registration.py` | workers registering and re-registering, more workers joining, finding the id in Docker |
@@ -309,9 +320,27 @@ Several clients at once (20 MB each, total throughput):
 | 4 | 63 MB/s | 162 MB/s | 205 MB/s | 205 MB/s |
 | 8 | 121 MB/s | 171 MB/s | 239 MB/s | 205 MB/s |
 
-With several clients the total now levels off around 170 MB/s up and 205 MB/s
-down: everything (clients, controller, workers, one disk) runs on one machine,
-and every byte passes through the one controller.
+With several clients the total levels off around 200 MB/s: everything
+(clients, controller, workers, one disk) runs on one machine, and every byte
+passes through the one controller.
+
+### Reused connections
+
+The controller keeps a pool of open connections to each worker (one
+`requests.Session` per worker, up to `WORKER_CONNECTIONS`) and the workers run
+on waitress, which keeps connections open, instead of opening a new connection
+for every request. Local cluster, 4 workers, before and after (#24):
+
+| | Before | After |
+|---|---|---|
+| One small request to a worker (1000 health requests) | 14.3 ms | **1.7 ms** |
+| Replication report, 640 chunk copies (64 KB chunks) | 10.3 s | **1.3 s** |
+| One client, 100 MB, upload / download | 101 / 149 MB/s | 124--141 / 209--216 MB/s |
+| 8 clients at once, 20 MB each, upload / download | 165 / 200 MB/s | 205--215 / 192--199 MB/s |
+
+The gain is largest where there are many small requests (health checks, the
+replication report, repair, cleanup); big transfers gain less, because moving
+the megabyte, not opening the connection, is most of their cost.
 
 ## Limitations
 
