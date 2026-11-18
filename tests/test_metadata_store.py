@@ -20,13 +20,19 @@ def nodes4():
 
 def restart(d, nodes=None, **kwargs):
     """A new controller over the same metadata file (the nodes kept their chunks)."""
-    return Distributor(d.nodes if nodes is None else nodes, chunk_size=d.chunk_size, store=JsonFileStore(d.store.path),
-                       **kwargs)
+    return Distributor(d.nodes if nodes is None else nodes, chunk_size=d.chunk_size,
+                       store=store_from_setting(d.store.path), **kwargs)
 
 
 @pytest.fixture
 def path(tmp_path):
     return str(tmp_path / "meta" / "metadata.json")
+
+
+@pytest.fixture(params=["metadata.db", "metadata.json"], ids=["sqlite", "json"])
+def store_path(tmp_path, request):
+    """A metadata path for each kind of store: the restart tests run for both."""
+    return str(tmp_path / "meta" / request.param)
 
 
 class TestJsonFileStore:
@@ -78,9 +84,9 @@ class TestJsonFileStore:
 
 
 class TestRestart:
-    def test_everything_survives_a_restart(self, path):
+    def test_everything_survives_a_restart(self, store_path):
         nodes = nodes4()
-        d = Distributor(nodes, chunk_size=100, store=JsonFileStore(path))
+        d = Distributor(nodes, chunk_size=100, store=store_from_setting(store_path))
         data = os.urandom(350)
         oid = d.upload("a.bin", data, content_type="x/y", custom={"k": "v"}, source_path="/f/a.bin", client_id="alice")
         d.update_custom_metadata(oid, {"k2": "v2"})
@@ -94,8 +100,8 @@ class TestRestart:
             d2.upload("a.bin", b"again", source_path="/f/a.bin", client_id="alice")
         d2.upload("a.bin", b"other client", source_path="/f/a.bin", client_id="bob")
 
-    def test_deletes_and_patches_are_saved_too(self, path):
-        d = Distributor(nodes4(), chunk_size=100, store=JsonFileStore(path))
+    def test_deletes_and_patches_are_saved_too(self, store_path):
+        d = Distributor(nodes4(), chunk_size=100, store=store_from_setting(store_path))
         keep = d.upload("keep", b"1" * 50)
         gone = d.upload("gone", b"2" * 50, source_path="/p")
         d.delete(gone)
@@ -105,9 +111,9 @@ class TestRestart:
         assert d2.get_object(keep).custom == {"a": "1"}
         d2.upload("again", b"3", source_path="/p")               # the deleted object's path is free again
 
-    def test_repair_changes_are_saved(self, path):
+    def test_repair_changes_are_saved(self, store_path):
         nodes = nodes4()
-        d = Distributor(nodes, chunk_size=100, store=JsonFileStore(path))
+        d = Distributor(nodes, chunk_size=100, store=store_from_setting(store_path))
         oid = d.upload("f", os.urandom(300))
         victim = d.get_object(oid).chunks[0].replicas[0]
         next(n for n in nodes if n.node_id == victim).down = True
@@ -115,9 +121,9 @@ class TestRestart:
         d2 = restart(d)
         assert all(victim not in c.replicas for c in d2.get_object(oid).chunks)
 
-    def test_workers_that_have_not_registered_yet_count_as_down(self, path):
+    def test_workers_that_have_not_registered_yet_count_as_down(self, store_path):
         nodes = nodes4()
-        d = Distributor(nodes, chunk_size=100, store=JsonFileStore(path))
+        d = Distributor(nodes, chunk_size=100, store=store_from_setting(store_path))
         data = os.urandom(300)
         oid = d.upload("f", data)
         d2 = restart(d, nodes=[])                                # fresh controller: nobody registered yet
@@ -149,13 +155,13 @@ class TestRestartWithRealWorkers:
         data = {f"f{i}": os.urandom(MB + i * 1000) for i in range(3)}
         ids = {name: upload_ok(cluster, name, blob)["object_id"] for name, blob in data.items()}
         fresh = Distributor([RemoteNode(n, cluster.node_url(n)) for n in NODE_IDS],
-                            store=JsonFileStore(cluster.metadata_path))
+                            store=store_from_setting(cluster.metadata_path))
         for name, oid in ids.items():
             assert fresh.download(oid) == data[name]
 
     def test_the_file_is_written_on_every_change(self, cluster):
         oid = upload_ok(cluster, "f", b"abc")["object_id"]
-        saved = json.load(open(cluster.metadata_path))["objects"]
+        saved = store_from_setting(cluster.metadata_path).load()     # read by a second connection
         assert [o["object_id"] for o in saved] == [oid]
         requests.delete(f"{cluster.api}/objects/{oid}", timeout=TIMEOUT)
-        assert json.load(open(cluster.metadata_path))["objects"] == []
+        assert store_from_setting(cluster.metadata_path).load() == []

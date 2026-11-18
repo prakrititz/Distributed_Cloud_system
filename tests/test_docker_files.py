@@ -251,7 +251,7 @@ class TestDockerfiles:
 
     def test_the_controller_keeps_its_metadata_in_a_volume(self):
         text = read("Dockerfile.controller")
-        assert 'VOLUME ["/meta"]' in text and "METADATA_PATH=/meta/metadata.json" in text
+        assert 'VOLUME ["/meta"]' in text and "METADATA_PATH=/meta/metadata.db" in text
         assert text.index("chown app:app /meta") < text.index("VOLUME")
 
     def test_the_client_image(self):

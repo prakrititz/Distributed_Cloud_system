@@ -135,7 +135,7 @@ class Cluster:
 
     @property
     def metadata_path(self) -> str:
-        return os.path.join(self.base_dir, "controller", "metadata.json")
+        return os.path.join(self.base_dir, "controller", "metadata.db")
 
     def node_dir(self, node_id: str) -> str:
         return os.path.join(self.base_dir, node_id)

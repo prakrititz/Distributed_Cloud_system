@@ -48,7 +48,7 @@ tests/                                     the test suite (needs no Docker)
 | `demo.py` | Runs the spec's demonstrations against the running system |
 | `controller/distributor.py` | Chunking, placement, metadata, reassembly, health report, repair, auto-repair, orphan detection |
 | `controller/remote_node.py` | `RemoteNode`: the controller's HTTP client for one worker |
-| `controller/metadata_store.py` | Saves the metadata to a JSON file atomically and loads it on start |
+| `controller/metadata_store.py` | Saves the metadata in a SQLite database (only the rows a change touches) and loads it on start; the older JSON file store is still there |
 | `nodes/node_server.py` | One worker as its own Flask process, served by waitress; registers itself (once it is listening) and sends heartbeats |
 | `nodes/identity.py` | How a worker started by Docker Compose finds its own id (worker1, worker2, ...) |
 | `nodes/node.py` | `ChunkStore`: the worker's file-backed chunk storage, with checksums |
@@ -150,10 +150,24 @@ seconds (60 by default; the age is the time since the copy was written on that
 worker), and it works only with saved metadata, since an empty in-memory
 controller would see every chunk as an orphan.
 
-**Persistent metadata:** all metadata is saved to `METADATA_PATH` after every
-change (written to a temp file, then renamed, so a crash never leaves a
-half-written file) and loaded on start. Restarting the controller keeps every
-object. Workers it has not heard from yet count as down until they register.
+**Persistent metadata:** the metadata is saved in a SQLite database at
+`METADATA_PATH` (Docker: `/meta/metadata.db` in the `controller-data` volume)
+and loaded on start, so restarting the controller keeps every object. SQLite is
+a library inside the controller, not a separate server: the controller reads and
+writes the file itself. Three tables hold one row per object, per chunk and per
+copy; each change (an upload, a delete, a metadata update, one chunk's copies
+after a repair) is one transaction that writes only its own rows, so its cost
+does not grow with the number of objects stored, and a crash mid-change leaves
+the previous state. The database also enforces the duplicate rule (one object
+per client and path) and indexes the copies by worker. The controller keeps a
+copy of the metadata in memory for reads. An existing `metadata.json` from the
+older JSON store is imported on the first start; a `METADATA_PATH` ending in
+`.json` still uses the JSON file. Workers it has not heard from yet count as
+down until they register.
+
+The file can be inspected with any SQLite tool, e.g.
+`docker cp object-store-controller-1:/meta/metadata.db .` and then
+`sqlite3 metadata.db "SELECT name, size FROM objects"`.
 
 **Duplicates:** objects are identified by `object_id`; the file name is only
 metadata. An upload is a duplicate if the same client (`client_id`) uploads the
@@ -244,7 +258,7 @@ In Docker they are at the top of `docker-compose.yml` (see [GUIDE.md](GUIDE.md))
 | `WORKER_NAME` | worker | worker | prefix of the worker ids |
 | `API_PORT` (`PORT`) | 5000 | controller | the API's port |
 | `AUTO_REPAIR_GRACE` | 30 | controller | seconds down before automatic repair; 0 = off |
-| `METADATA_PATH` | ./data/controller/metadata.json (Docker: /meta/metadata.json) | controller | where metadata is saved; empty = memory only |
+| `METADATA_PATH` | ./data/controller/metadata.db (Docker: /meta/metadata.db) | controller | where metadata is saved: a SQLite file (a path ending in .json uses the JSON file instead); empty = memory only |
 | `ORPHAN_MIN_AGE` | 60 | controller | default `min_age` of cleanup |
 | `API_URL`, `CLIENT_ID` | http://127.0.0.1:5000/api/v1, machine name | client | where the API is, who this client is |
 | `NODE_ID`, `PORT`, `DATA_DIR`, `CONTROLLER_URL` | worker1, 5001, ./data/{node_id}, http://127.0.0.1:5000 | worker | for running a worker by hand |
@@ -266,7 +280,8 @@ python -m pytest tests -m "not cluster"   # only the fast tests that start no se
 | `test_integrity.py` | damage on disk and in transit |
 | `test_heartbeat.py`, `test_failure_and_repair.py` | heartbeats, a worker stopping and returning, repair |
 | `test_auto_repair.py` | repair after the grace period, none for a quick restart, retry when it could not finish |
-| `test_metadata_store.py` | saving and loading the metadata, a crash during a save, a controller restart |
+| `test_metadata_store.py` | saving and loading the metadata, a crash during a save, a controller restart (with both stores) |
+| `test_sqlite_store.py` | the SQLite store: every field round-trips, a change writes only its own rows, a failure part-way rolls back, the duplicate rule in the database, the index by worker, importing an old metadata.json |
 | `test_cleanup.py` | orphans and missing chunks, cleanup, uploads in progress left alone |
 | `test_multi_client.py` | several clients at once: same paths, races, parallel patches and deletes |
 | `test_client.py` | the client: menu, commands, original bytes on download |
@@ -342,6 +357,21 @@ The gain is largest where there are many small requests (health checks, the
 replication report, repair, cleanup); big transfers gain less, because moving
 the megabyte, not opening the connection, is most of their cost.
 
+### Saving the metadata
+
+Cost of saving one change, as the number of stored objects grows (each object
+10 chunks with 2 copies):
+
+| Objects stored | JSON file: one upload | SQLite: one upload | JSON: one chunk repaired | SQLite: one chunk repaired | File size JSON / SQLite |
+|---|---|---|---|---|---|
+| 100 | 15 ms | 1.4 ms | 17 ms | 0.5 ms | 0.3 / 1.2 MB |
+| 1,000 | 167 ms | 1.5 ms | 158 ms | 0.8 ms | 3.1 / 11 MB |
+| 10,000 | 2,052 ms | 0.9 ms | 2,041 ms | 0.9 ms | 31 / 111 MB |
+
+The JSON file is rewritten on every change, so each change gets slower as the
+store grows; SQLite writes only the rows a change touches. Its file is larger
+(indexes, and the write-ahead log next to it).
+
 ## Limitations
 
 - A multipart upload (`curl -F`) is first written in full to a temporary file
@@ -351,8 +381,9 @@ the megabyte, not opening the connection, is most of their cost.
   client notices and discards it).
 - In Docker all workers share one volume (each in its own folder), because
   Compose cannot give each copy of a scaled service its own named volume.
-- The metadata file is rewritten in full on every change: fine for a project,
-  slow for millions of objects.
+- The metadata is a SQLite file used by one controller; several controllers
+  could not share it. The controller also keeps all metadata in memory for
+  reads.
 - The controller's picture of the workers is up to a heartbeat old (2 s). A
   worker that has just died can still be chosen once; the failed write is
   noticed and the next worker is used.
