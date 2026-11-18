@@ -4,6 +4,8 @@ a chunk damaged, a write refused) and with every call counted.
 
 It has the same methods and error behavior as controller/remote_node.py.
 """
+import threading
+
 from helpers.checksum import compute
 from helpers.errors import ChunkCorrupt, NodeUnavailable
 
@@ -20,10 +22,12 @@ class FakeNode:
         self.health_calls = 0
         self.store_calls = []     # chunk ids we were asked to store (even if refused)
         self.ages = {}            # chunk_id -> age reported by list_chunks (default: old)
+        self._lock = threading.RLock()   # the distributor writes several chunks at once
 
     # --- helpers for tests -------------------------------------------------
     def used(self) -> int:
-        return sum(len(v) for v in self.chunks.values())
+        with self._lock:
+            return sum(len(v) for v in list(self.chunks.values()))
 
     def damage(self, chunk_id: str) -> None:
         """Flip a byte of the stored chunk, like damage on disk."""
@@ -59,11 +63,12 @@ class FakeNode:
         self._up()
         if self.refuse_writes:
             raise ChunkCorrupt(f"{self.node_id} received chunk '{chunk_id}' damaged in transit")
-        existing = len(self.chunks.get(chunk_id, b""))
-        if len(data) - existing > self.capacity - self.used():
-            return False
-        self.chunks[chunk_id] = bytes(data)
-        self.sums[chunk_id] = compute(data)
+        with self._lock:      # chunks in flight can reach the same node at once
+            existing = len(self.chunks.get(chunk_id, b""))
+            if len(data) - existing > self.capacity - self.used():
+                return False
+            self.chunks[chunk_id] = bytes(data)
+            self.sums[chunk_id] = compute(data)
         if self.on_store:
             self.on_store(chunk_id)
         return True
@@ -87,8 +92,9 @@ class FakeNode:
 
     def list_chunks(self) -> list:
         self._up()
-        return [{"chunk_id": c, "size": len(d), "age": self.ages.get(c, 1000.0)}
-                for c, d in sorted(self.chunks.items())]
+        with self._lock:
+            return [{"chunk_id": c, "size": len(d), "age": self.ages.get(c, 1000.0)}
+                    for c, d in sorted(self.chunks.items())]
 
     def has_chunk(self, chunk_id: str) -> bool:
         return (not self.down) and chunk_id in self.chunks
