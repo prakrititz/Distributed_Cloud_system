@@ -55,6 +55,12 @@ NODE_ADDRESSES = parse_workers(os.environ["WORKERS"]) if os.environ.get("WORKERS
 CHUNK_SIZE = _int_setting("CHUNK_SIZE", 1024 * 1024)        # bytes per chunk (1 MB, as the spec says)
 REPLICATION_FACTOR = _int_setting("REPLICATION_FACTOR", 2)  # copies of every chunk, each on a different worker
 
+# Uploads and downloads are streamed, one chunk at a time, so each needs only
+# about one chunk of the controller's memory. At most this many run at once
+# (more are refused with 503, "try again"), so the controller's memory use
+# stays bounded however many clients there are.
+MAX_TRANSFERS = _int_setting("MAX_TRANSFERS", 32)
+
 # Where the controller saves its metadata, so a restart keeps every object.
 # Empty ("") keeps it only in memory.
 METADATA_PATH = os.environ.get("METADATA_PATH", "./data/controller/metadata.json").strip()

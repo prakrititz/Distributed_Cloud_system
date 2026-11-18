@@ -93,8 +93,9 @@ class RemoteNode:
         return self.health()["chunks"]
 
     # --- chunk operations ------------------------------------------------
-    def store_chunk(self, chunk_id: str, data: bytes) -> bool:
-        """PUT the chunk's raw bytes together with their checksum. True if
+    def store_chunk(self, chunk_id: str, data: bytes, checksum: str = None) -> bool:
+        """PUT the chunk's raw bytes together with their checksum (pass it if
+        it is already known, so the chunk is not hashed again). True if
         stored, False if the node has no space. Raises NodeUnavailable if the
         node is unreachable, ChunkCorrupt if the node says the bytes arrived
         damaged (nothing is stored then)."""
@@ -103,7 +104,7 @@ class RemoteNode:
             data=data,
             headers={
                 "Content-Type": "application/octet-stream",
-                "X-Checksum": compute(data),   # the node verifies this on arrival
+                "X-Checksum": checksum or compute(data),   # the node verifies this on arrival
             },
         )
         if response.status_code == 201:

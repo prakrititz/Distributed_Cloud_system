@@ -1,7 +1,11 @@
 """Client: talks to the Flask API (the distributor) over HTTP.
 
-Upload  : file path -> read the bytes -> POST them (with their checksum) to the API
-Download: GET from the API -> check the checksum -> save the bytes
+Upload  : file path -> checksum it -> stream the file to the API as the body of the request
+Download: GET from the API -> write it to a temporary file, checksumming as it
+          arrives -> if the size and checksum are right, rename it into place
+
+Both are streamed, a block at a time, so a file of any size needs only a little
+memory, here and on the controller.
 
 The bytes stored are exactly the file's bytes, so a download with curl or a
 browser gives back the original file too.
@@ -15,15 +19,16 @@ import mimetypes
 import os
 import socket
 import sys
+import tempfile
 
 import requests
 
-from helpers.checksum import compute, verify
-from helpers.file_upload import read_document, save_document
+from helpers.checksum import compute, compute_file, matches, running
 
 # Where the API is. Override with API_URL (in Docker: http://controller:5000/api/v1).
 # Default uses 127.0.0.1, not "localhost": slow on Windows (IPv6 first).
 BASE_URL = os.environ.get("API_URL", "http://127.0.0.1:5000/api/v1")
+BLOCK = 1024 * 1024   # bytes read or written at a time while streaming
 
 
 def default_client_id() -> str:
@@ -50,54 +55,77 @@ class Client:
         raise ValueError(f"Server said {response.status_code}: {message}")
 
     def upload(self, path: str, metadata: dict = None) -> dict:
-        """Read the file and send its bytes together with their checksum (so
-        the server can detect damage in transit), its content type, its full
-        path and this client's id (two uploads from the same path by the same
-        client are refused as the same file) and optional custom metadata.
+        """Upload a file, streamed from disk (never read into memory whole).
+        Sent with it: its checksum (so the server can detect damage in
+        transit), its content type, its full path and this client's id (two
+        uploads from the same path by the same client are refused as the same
+        file) and optional custom metadata.
         Returns the new object's metadata (object_id, size, content_type,
         times, chunks...)."""
-        data = read_document(path)
-
         name = os.path.basename(path)
         content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
-        form = {
-            "checksum": compute(data),               # fingerprint of exactly these bytes
+        params = {
+            "name": name,
+            "checksum": compute_file(path),          # fingerprint of exactly these bytes
             "path": os.path.abspath(path),
             "client_id": self.client_id,             # the duplicate rule is per client + path
         }
         if metadata:
-            form["metadata"] = json.dumps(metadata)
+            params["metadata"] = json.dumps(metadata)
 
-        response = requests.post(
-            f"{self.base_url}/objects",
-            files={"file": (name, data, content_type)},
-            data=form,
-        )
+        # A raw upload: the body of the request is the file itself. Passing the
+        # open file makes requests send it a block at a time.
+        with open(path, "rb") as f:
+            response = requests.post(f"{self.base_url}/objects", params=params, data=f,
+                                     headers={"Content-Type": content_type})
         self._check(response)
         return response.json()
 
     def retrieve(self, object_id: str, save_to: str = None) -> str:
-        """Fetch the object by id, verify it against the checksum the server
-        sent, and write it to save_to. Without save_to, it is
-        saved under its original name (taken from the metadata) in the current
-        folder, and an existing file is never overwritten. Returns the path it
-        was saved to. Raises ValueError if the data arrived damaged."""
-        response = requests.get(f"{self.base_url}/objects/{object_id}")
-        self._check(response)
+        """Fetch the object by id and write it to save_to. Without save_to, it
+        is saved under its original name (taken from the metadata) in the
+        current folder, and an existing file is never overwritten. Returns the
+        path it was saved to.
 
-        expected = response.headers.get("X-Checksum")
-        if expected and not verify(response.content, expected):
-            raise ValueError("Checksum mismatch: the download was damaged in transit")
-
-        document = response.content
-
+        It arrives a block at a time and goes into a temporary file next to
+        the target, checksummed on the way. Only if all of it arrived and the
+        checksum matches the one the server sent is it renamed into place;
+        otherwise the temporary file is deleted and ValueError is raised, so a
+        damaged or incomplete download is never saved (and never replaces an
+        existing file)."""
         if save_to is None:
             name = os.path.basename(self.get_metadata(object_id)["name"]) or object_id
             if os.path.exists(name):
                 raise ValueError(f"'{name}' already exists here; choose another name to save as")
             save_to = name
-        save_document(save_to, document)
+
+        with requests.get(f"{self.base_url}/objects/{object_id}", stream=True) as response:
+            self._check(response)
+            expected = response.headers.get("X-Checksum")
+            length = response.headers.get("Content-Length")
+            folder = os.path.dirname(os.path.abspath(save_to))
+            fd, partial = tempfile.mkstemp(dir=folder, prefix=f".{os.path.basename(save_to)}.",
+                                           suffix=".part")
+            try:
+                whole, received = running(), 0
+                with os.fdopen(fd, "wb") as out:
+                    try:
+                        for block in response.iter_content(BLOCK):
+                            out.write(block)
+                            whole.update(block)
+                            received += len(block)
+                    except requests.RequestException as e:
+                        raise ValueError(f"The download was cut off after {received} bytes ({e})") from e
+                if length is not None and received != int(length):
+                    raise ValueError(f"The download is incomplete: {received} of {length} bytes")
+                if expected and not matches(whole.hexdigest(), expected):
+                    raise ValueError("Checksum mismatch: the download was damaged in transit")
+                os.replace(partial, save_to)
+            except BaseException:
+                os.remove(partial)
+                raise
         return save_to
+
 
     def get_metadata(self, object_id: str) -> dict:
         """The object's metadata, without downloading it."""

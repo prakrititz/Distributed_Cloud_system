@@ -88,18 +88,30 @@ class TestClientAgainstTheCluster:
         real_get = requests.get
 
         class Damaged:
+            """The real streamed response, with the first byte flipped on the way."""
             def __init__(self, r):
                 self._r = r
                 self.headers = r.headers
                 self.ok = r.ok
                 self.status_code = r.status_code
-                self.content = bytes([r.content[0] ^ 0xFF]) + r.content[1:]
+
+            def iter_content(self, size):
+                first = True
+                for block in self._r.iter_content(size):
+                    yield bytes([block[0] ^ 0xFF]) + block[1:] if first else block
+                    first = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._r.close()
 
         monkeypatch.setattr(client_module.requests, "get",
                             lambda url, *a, **k: Damaged(real_get(url, *a, **k)) if url.endswith(m["object_id"]) else real_get(url, *a, **k))
         with pytest.raises(ValueError, match="damaged in transit"):
             c.retrieve(m["object_id"], str(tmp_path / "out.bin"))
-        assert not (tmp_path / "out.bin").exists()
+        assert os.listdir(tmp_path) == ["f.bin"]                         # no file, no temporary file left
 
 
 class TestOriginalBytes:
