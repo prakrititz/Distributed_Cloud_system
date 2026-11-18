@@ -58,11 +58,15 @@ tests/                                     the test suite (needs no Docker)
 
 ## How it works
 
-**Upload:** split the bytes into chunks of at most `CHUNK_SIZE`. For each chunk,
-place `REPLICATION_FACTOR` copies on different live workers with room. The name
-and metadata are registered (and saved) only after every copy of every chunk is
-stored. If any copy cannot be stored, every copy already written is deleted and
-the upload fails with 503, so a chunk is never kept with fewer copies.
+**Upload:** the file is read `CHUNK_SIZE` bytes at a time. Each chunk gets
+`REPLICATION_FACTOR` copies on different live workers with room, and only then
+is the next chunk read, so the controller holds about one chunk, never the whole
+file. The checksum of the whole file is built up as the chunks go by and
+compared with the client's at the end. The name and metadata are registered (and
+saved) only after every copy of every chunk is stored and the checksum matches.
+If anything fails (a copy cannot be stored: 503; the checksum is wrong: 400; the
+client stops sending), every copy already written is deleted, so nothing
+half-uploaded is ever visible and a chunk is never kept with fewer copies.
 
 **Placement:** for each copy, prefer the worker that has shared the fewest
 chunks with the workers already holding this chunk, then the one with the most
@@ -80,9 +84,30 @@ with its capacity and free space. A worker silent for 6 s is treated as down.
 Placement reads this table, so it sends no requests to the workers. A chosen
 worker that turns out to be dead or full is skipped and the next one is tried.
 
-**Download:** read each chunk from the first copy that is up and intact (checked
-against the checksum recorded at upload); fall back to the other copy. 503 only
-if every copy of some chunk is unavailable.
+**Download:** streamed too: each chunk is read from the first copy that is up
+and intact (checked against the checksum recorded at upload, falling back to
+the other copy), sent, and dropped before the next. The response carries
+`Content-Length` and `X-Checksum` (the checksum recorded at upload). Before
+anything is sent, the controller checks that every chunk has a copy on a live
+worker and reads the first chunk, so the usual failures are a clear 503. If a
+later chunk turns out to have no good copy (say both copies were damaged on
+disk), the response has already started: the connection is closed early, the
+client sees fewer bytes than `Content-Length`, and `client.py` throws the
+download away.
+
+`client.py` streams as well: it uploads the file straight from disk, and
+downloads into a temporary file next to the target, checksumming it on the way;
+only if the size and checksum are right is it renamed into place, so a damaged
+or incomplete download never replaces anything.
+
+**Delete during a download:** the object disappears from the metadata at once
+(new requests get 404), but its copies are deleted only when the downloads
+already running have finished, so they are never cut off half-way. Cleanup
+leaves those copies alone meanwhile.
+
+**Transfers at once:** at most `MAX_TRANSFERS` uploads and downloads run at the
+same time (503 with `Retry-After: 1` beyond that), so the controller's memory
+stays bounded: about one chunk per transfer.
 
 **Health:** `GET /api/v1/replication` reports each chunk as `healthy`,
 `under_replicated` (still downloadable) or `unavailable`, and each copy as `ok`,
@@ -126,8 +151,8 @@ same name from different folders is always fine. Uploads with no path (plain
 ## Metadata
 
 `object_id`, `name`, `size`, `content_type`, `created_at`, `modified_at`,
-`checksum`, `source_path`, `client_id`, the chunk list (index, id, checksum and
-the workers holding each copy) and `custom` key-value pairs. `PATCH` adds,
+`checksum`, `source_path`, `client_id`, the chunk list (index, id, size,
+checksum and the workers holding each copy) and `custom` key-value pairs. `PATCH` adds,
 changes or (with `null`) removes custom keys; the stored data is never touched.
 
 ```
@@ -135,7 +160,8 @@ GET /api/v1/objects/<object_id>/metadata
 { "object_id": "3f2a...", "name": "movie.mp4", "size": 3145737, "content_type": "video/mp4",
   "created_at": "2026-11-15T10:12:03Z", "modified_at": "2026-11-15T10:12:03Z",
   "checksum": "ab12...", "chunk_count": 4, "copies_per_chunk": 2,
-  "chunks": [{"index": 0, "chunk_id": "...-0", "checksum": "...", "replicas": ["worker1", "worker3"]}, ...],
+  "chunks": [{"index": 0, "chunk_id": "...-0", "size": 1048576, "checksum": "...",
+              "replicas": ["worker1", "worker3"]}, ...],
   "custom": {"project": "demo"} }
 ```
 
@@ -143,9 +169,9 @@ GET /api/v1/objects/<object_id>/metadata
 
 | Method | Endpoint | Purpose | Errors |
 |---|---|---|---|
-| POST | `/api/v1/objects` | Upload (multipart): `file` required; optional `metadata` (JSON object), `checksum`, `path`, `client_id`, `size`. 201 with the metadata | 400 bad field / checksum mismatch, 409 same client + path, 503 not enough room on enough live workers |
+| POST | `/api/v1/objects` | Upload, two ways (below). Optional fields: `metadata` (JSON object), `checksum`, `path`, `client_id`, `size`. 201 with the metadata | 400 bad field / checksum mismatch / upload cut off, 409 same client + path, 503 not enough room on enough live workers or `MAX_TRANSFERS` busy |
 | GET | `/api/v1/objects` | List objects; optional `limit`, `offset`; total in `X-Total-Count` | 400 |
-| GET | `/api/v1/objects/<id>` | Download: the original bytes, with the content type and an `X-Checksum` header | 404, 503 |
+| GET | `/api/v1/objects/<id>` | Download, streamed: the original bytes, with the content type, `Content-Length` and an `X-Checksum` header | 404, 503 (no live copy of a chunk, or busy) |
 | GET | `/api/v1/objects/<id>/metadata` | The object's metadata | 404 |
 | PATCH | `/api/v1/objects/<id>/metadata` | Add/update custom metadata (`null` removes a key) | 400, 404 |
 | DELETE | `/api/v1/objects/<id>` | Delete the object and all copies, 204 | 404 |
@@ -160,15 +186,29 @@ GET /api/v1/objects/<object_id>/metadata
 Errors are always JSON: `{"error": "..."}`. The workers' own endpoints
 (`/internal/chunks/...`, `/internal/health`) are used only by the controller.
 
+The two ways to upload:
+
+```
+# multipart form, the file in the 'file' field (what curl -F and HTML forms send).
+# The web server first writes the whole upload to a temporary file, then it is read chunk by chunk.
+curl -F "file=@movie.mp4" -F 'metadata={"project": "demo"}' http://localhost:5000/api/v1/objects
+
+# raw: the body is the file, the fields go in the query string ('name' required),
+# Content-Type is the object's type. Chunks go to the workers while the body is arriving.
+# This is what client.py sends.
+curl -X POST -T movie.mp4 -H "Content-Type: video/mp4" \
+     "http://localhost:5000/api/v1/objects?name=movie.mp4&client_id=me"
+```
+
 ## Integrity checks (checksums)
 
 | Where | What is checked | If it fails |
 |---|---|---|
-| Client -> controller | The client sends the file's checksum; the controller verifies it before storing anything | 400, nothing stored |
-| Controller -> client | The download carries `X-Checksum`; the client verifies it | the client reports an error |
+| Client -> controller | The client sends the file's checksum; the controller builds up the checksum of what arrives, chunk by chunk, and compares at the end | 400, everything stored is deleted |
+| Controller -> client | The download carries `X-Checksum` (recorded at upload) and `Content-Length`; the client checks both while writing a temporary file | the client deletes it and reports an error |
 | Controller -> worker | Each chunk is sent with `X-Checksum`; the worker verifies it before writing | 422, the upload rolls back |
 | On the worker | A checksum is saved next to each chunk (`.checksums/`) and rechecked on every read | 409, the damaged chunk is not sent |
-| Controller, on read | Every chunk is checked against the checksum recorded at upload, the whole file against its checksum | that copy is skipped, the other is used |
+| Controller, on read | Every chunk is checked against the checksum recorded at upload, the whole file against its checksum as the chunks go by | that copy is skipped, the other is used |
 
 The controller's record is the authority: a worker cannot vouch for itself. If
 every copy of a chunk is damaged, the download fails with a clear 503 instead of
@@ -183,6 +223,7 @@ In Docker they are at the top of `docker-compose.yml` (see [GUIDE.md](GUIDE.md))
 | `WORKERS` | 4 | compose | number of worker containers |
 | `CHUNK_SIZE` | 1048576 | controller | bytes per chunk |
 | `REPLICATION_FACTOR` | 2 | controller | copies of every chunk |
+| `MAX_TRANSFERS` | 32 | controller | uploads and downloads at once; more get 503 |
 | `WORKER_CAPACITY` (`CAPACITY`) | 5242880 | worker | bytes a worker may store |
 | `WORKER_NAME` | worker | worker | prefix of the worker ids |
 | `API_PORT` (`PORT`) | 5000 | controller | the API's port |
@@ -213,15 +254,38 @@ python -m pytest tests -m "not cluster"   # only the fast tests that start no se
 | `test_cleanup.py` | orphans and missing chunks, cleanup, uploads in progress left alone |
 | `test_multi_client.py` | several clients at once: same paths, races, parallel patches and deletes |
 | `test_client.py` | the client: menu, commands, original bytes on download |
+| `test_streaming.py` | streamed uploads and downloads: one chunk at a time, raw uploads, checksum at the end, uploads and downloads cut off half-way, delete during a download, `MAX_TRANSFERS`, a 50 MB file in a few MB of memory |
 | `test_registration.py` | workers registering and re-registering, more workers joining, finding the id in Docker |
 | `test_docker_files.py` | each image's allowlist starts its program, the settings work, the compose file and Dockerfiles say what the spec requires |
 
 The slower tests start four real worker processes and the API on free local
 ports and stop them afterwards.
 
+## Memory
+
+Uploads and downloads are streamed, so the controller's memory does not grow
+with the file size. Extra memory of the controller process during one transfer
+(local cluster, 4 workers, `client.py` streaming from and to disk):
+
+| File | Upload, before | Upload, now | Download, before | Download, now |
+|---|---|---|---|---|
+| 20 MB | +51 MB | +16 MB | +41 MB | +0 MB |
+| 100 MB | +210 MB | +20 MB | +201 MB | +3 MB |
+| 500 MB | not measured (about 2x the file) | +17 MB | not measured (about 2x the file) | +11 MB |
+
+Most of what is left on upload is the development server itself: after each
+request it reads the rest of the connection into a fresh 10 MB buffer.
+`tests/test_streaming.py` checks that a 50 MB file passes through the client and
+the controller together in under 10 MB (about 3 MB up and 5 MB down; it was 200
+MB up and 100 MB down before).
+
 ## Limitations
 
-- Whole files are held in memory during upload and download.
+- A multipart upload (`curl -F`) is first written in full to a temporary file
+  on the controller's disk by the web server; a raw upload (`client.py`) is not.
+- If a later chunk of a download has no good copy, the response has already
+  started, so the connection is closed early instead of answering 503 (the
+  client notices and discards it).
 - In Docker all workers share one volume (each in its own folder), because
   Compose cannot give each copy of a scaled service its own named volume.
 - The metadata file is rewritten in full on every change: fine for a project,
