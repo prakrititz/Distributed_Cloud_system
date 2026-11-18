@@ -22,26 +22,45 @@ Checksums: every chunk sent carries its checksum in the 'X-Checksum' header,
 so the node can refuse a chunk damaged on the way. Chunks received are NOT
 checked here: the distributor verifies every chunk it reads against the
 checksum it recorded at upload, which also covers damage on the way back.
+
+Connections: each RemoteNode keeps a pool of open connections to its node and
+reuses them (HTTP keep-alive), so a request does not pay for setting up a new
+connection. The node's server (waitress) keeps them open on its side.
 """
 import requests
+from requests.adapters import HTTPAdapter
 
-from config import REQUEST_TIMEOUT
+from config import REQUEST_TIMEOUT, WORKER_CONNECTIONS
 from helpers.checksum import compute
 from helpers.errors import ChunkCorrupt, NodeUnavailable
 
 
 class RemoteNode:
-    def __init__(self, node_id: str, base_url: str, timeout=REQUEST_TIMEOUT):
+    def __init__(self, node_id: str, base_url: str, timeout=REQUEST_TIMEOUT,
+                 connections: int = WORKER_CONNECTIONS):
         self.node_id = node_id
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        # One session per worker, holding a pool of open connections to it.
+        # A request takes a free connection from the pool (or opens one),
+        # and gives it back afterwards instead of closing it (HTTP
+        # keep-alive), so later requests skip the connection set-up. Up to
+        # `connections` stay open; requests to this worker from several
+        # threads at once each get their own connection. A pooled connection
+        # the worker has closed (it restarted, or it was idle too long) is
+        # noticed before use and replaced.
+        self.session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=1, pool_maxsize=connections)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
 
     # --- the one place that actually sends HTTP --------------------------
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
-        """Send one request to this node. If the node cannot be reached (not
-        running, connection refused, too slow), raise NodeUnavailable."""
+        """Send one request to this node, on a pooled connection. If the node
+        cannot be reached (not running, connection refused, too slow), raise
+        NodeUnavailable."""
         try:
-            return requests.request(
+            return self.session.request(
                 method, self.base_url + path, timeout=self.timeout, **kwargs
             )
         except requests.RequestException as e:
