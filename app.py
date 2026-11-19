@@ -27,6 +27,7 @@ from config import (ADMINS, ALLOW_REGISTRATION, API_KEYS, AUTH_REQUIRED, AUTO_RE
                     ORPHAN_MIN_AGE, QUOTA_PER_CLIENT, RATE_BURST, RATE_PER_CLIENT, REGISTRATIONS_PER_MINUTE,
                     REPLICATION_FACTOR)
 from controller.access import CLIENT_ID_PATTERN, ClientRegistry, ClientSlots, KeyRing, RateLimiter
+from controller.activity import ActivityLog
 from controller.distributor import DEFAULT_CONTENT_TYPE, Distributor
 from controller.metadata_store import store_from_setting
 from controller.remote_node import RemoteNode
@@ -78,6 +79,8 @@ registration_limiter = RateLimiter(REGISTRATIONS_PER_MINUTE / 60, REGISTRATIONS_
 rate_limiter = RateLimiter(RATE_PER_CLIENT, RATE_BURST)    # requests per second per client
 client_slots = ClientSlots(MAX_TRANSFERS_PER_CLIENT)        # transfers at once per client
 quota_per_client = QUOTA_PER_CLIENT                         # bytes per client (0: no quota)
+# What each client did (uploads, downloads, ...), for GET /api/v1/me/activity.
+activity = ActivityLog(distributor.store)
 
 
 def busy():
@@ -382,7 +385,9 @@ def store_upload(fields, stream, filename: str, content_type: str):
     finally:
         give_back_transfer_slots(slot_client)
 
-    return jsonify(object_json(distributor.get_object(object_id))), 201
+    meta = distributor.get_object(object_id)
+    activity.record(g.client, "upload", meta.object_id, meta.name, meta.size)
+    return jsonify(object_json(meta)), 201
 
 
 def discard_body() -> None:
@@ -468,6 +473,7 @@ def download_object(object_id):
         raise
 
     finished = threading.Lock()
+    downloader = g.client          # (the body is sent after the request context is gone)
 
     def finish():
         """End the download (a delete waiting for it can go ahead) and free its
@@ -478,8 +484,10 @@ def download_object(object_id):
             give_back_transfer_slots(slot_client)
 
     def body():
+        complete = False
         try:
             yield from chunks
+            complete = True
         except Exception as e:
             print(f"[download] '{meta.name}' (object_id={object_id}) stopped part-way: {e}; "
                   "closing the connection")
@@ -488,6 +496,10 @@ def download_object(object_id):
             # also runs when the client went away part-way (the server then
             # drops this generator), even if the server never closes the response
             finish()
+        # only a download that was sent whole is history; after finish(), so
+        # writing it never keeps the client's transfer slot taken
+        if complete:
+            activity.record(downloader, "download", meta.object_id, meta.name, meta.size)
 
     response = Response(body(), mimetype=meta.content_type)
     sizes = [c.size for c in meta.chunks]
@@ -525,6 +537,8 @@ def update_metadata(object_id):
         meta = distributor.update_custom_metadata(object_id, updates)
     except KeyError:
         return error(f"No object with id '{object_id}'", 404)
+    activity.record(g.client, "metadata", meta.object_id, meta.name, meta.size,
+                    ", ".join(f"{k}={'(removed)' if v is None else v}" for k, v in updates.items()))
     return jsonify(object_json(meta))
 
 
@@ -532,13 +546,14 @@ def update_metadata(object_id):
 def delete_object(object_id):
     """Delete the object and every copy of its chunks. 204, 404 if unknown,
     403 if the caller may read but not delete it."""
-    _, refused = find_object(object_id, change=True)
+    meta, refused = find_object(object_id, change=True)
     if refused:
         return refused
     try:
         distributor.delete(object_id)
     except KeyError:
         return error(f"No object with id '{object_id}'", 404)
+    activity.record(g.client, "delete", meta.object_id, meta.name, meta.size)
     return "", 204
 
 
@@ -567,6 +582,8 @@ def put_readers(object_id):
             or any(not isinstance(r, str) or not r.strip() or len(r) > MAX_CLIENT_ID_LENGTH for r in readers)):
         return error(f"The body must be {{\"readers\": [client ids]}}, at most {MAX_READERS} of them", 400)
     meta = distributor.set_readers(object_id, [r.strip() for r in readers])
+    activity.record(g.client, "share", meta.object_id, meta.name, meta.size,
+                    "readers: " + (", ".join(meta.readers) or "nobody"))
     return jsonify({"object_id": meta.object_id, "owner": meta.client_id, "readers": meta.readers})
 
 
@@ -611,6 +628,7 @@ def register_client():
     except ValueError:                                                # registered a moment ago by someone else
         return error(f"The client id '{client_id}' is taken; choose another", 409)
     print(f"[controller] client {client_id} registered itself", flush=True)
+    activity.record(client_id, "register", detail="registered and received an API key")
     return jsonify({
         "client_id": client_id,
         "api_key": key,
@@ -635,6 +653,25 @@ def who_am_i():
         "transfers_allowed": client_slots.limit if keyring.enabled else transfers.limit,
         "requests_per_second": rate_limiter.rate if keyring.enabled and rate_limiter.enabled else None,
     })
+
+
+MAX_ACTIVITY = 500
+
+
+@app.route("/api/v1/me/activity", methods=["GET"])
+def my_activity():
+    """What the caller did, newest first: its uploads, downloads, deletes,
+    metadata changes and shares, whichever program it used. Each entry:
+    {at, action, object_id, name, size, detail}. 'limit' (default 50, at most
+    500). Kept for authenticated clients only (without authentication nobody
+    is known, so the list is empty)."""
+    try:
+        limit = int(request.args.get("limit", 50))
+        if not 0 <= limit <= MAX_ACTIVITY:
+            raise ValueError
+    except ValueError:
+        return error(f"'limit' must be a whole number from 0 to {MAX_ACTIVITY}", 400)
+    return jsonify(activity.recent(g.client, limit))
 
 
 @app.route("/api/v1/nodes", methods=["GET"])
@@ -688,6 +725,13 @@ def worker_report(body):
         return (f"Body must be JSON with a 'worker_id' string (1-{MAX_WORKER_ID_LENGTH} characters) "
                 "and non-negative integers 'capacity', 'used', 'free' and 'chunks'")
     return None
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """The controller is up and answering (Docker's healthcheck). Needs no
+    key and tells nothing about what is stored."""
+    return jsonify({"status": "ok"})
 
 
 @app.route("/internal/workers/register", methods=["POST"])

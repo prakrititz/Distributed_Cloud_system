@@ -57,6 +57,21 @@ class TestClientAgainstTheCluster:
         saved = c.retrieve(m["object_id"])
         assert saved == "todo.txt" and (out / "todo.txt").read_bytes() == src.read_bytes()
 
+    @pytest.mark.skipif(os.name == "nt", reason="Windows has no Unix file permissions")
+    def test_a_download_is_readable_like_any_new_file(self, cluster, tmp_path, monkeypatch):
+        # it is written to a temporary file (0600) first; in the client
+        # container (another user) that left it unreadable on the host
+        c = Client(base_url=cluster.api, client_id="t")
+        src = tmp_path / "a.txt"
+        src.write_bytes(b"hello")
+        oid = c.upload(str(src))["object_id"]
+        old = os.umask(0o022)
+        try:
+            saved = c.retrieve(oid, str(tmp_path / "copy.txt"))
+        finally:
+            os.umask(old)
+        assert os.stat(saved).st_mode & 0o777 == 0o644
+
     def test_download_never_overwrites_an_existing_file(self, cluster, tmp_path, monkeypatch):
         c = Client(base_url=cluster.api, client_id="t")
         src = tmp_path / "f.txt"

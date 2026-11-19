@@ -26,6 +26,10 @@ The stores also keep the clients that registered themselves (see
 controller/access.py, ClientRegistry): load_clients() -> [(client_id,
 key_hash)], add_client(client_id, key_hash, created_at) (ValueError if the id
 or the hash is taken). Only a hash of each key is ever stored.
+
+SqliteStore also keeps each client's activity (controller/activity.py):
+add_activity(client_id, entry, keep), load_activity(client_id, limit). The
+other stores do not; their activity is kept in memory instead.
 """
 import json
 import os
@@ -194,6 +198,18 @@ CREATE TABLE IF NOT EXISTS clients (
     key_hash   TEXT NOT NULL UNIQUE,                -- SHA-256 of the key, hex; looked up on every request
     created_at TEXT NOT NULL
 );
+-- what each client did (controller/activity.py): the latest few hundred per client
+CREATE TABLE IF NOT EXISTS activity (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_id TEXT NOT NULL,
+    at        TEXT NOT NULL,
+    action    TEXT NOT NULL,                         -- upload / download / delete / metadata / share / register
+    object_id TEXT NOT NULL DEFAULT '',
+    name      TEXT NOT NULL DEFAULT '',
+    size      INTEGER,
+    detail    TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS activity_by_client ON activity (client_id, id);
 """
 
 
@@ -273,6 +289,27 @@ class SqliteStore:
                                  (client_id, key_hash, created_at))
         except sqlite3.IntegrityError:
             raise ClientTaken(client_id) from None
+
+    def add_activity(self, client_id: str, entry: dict, keep: int) -> None:
+        """Remember one thing a client did; keep only its latest `keep` entries."""
+        with self._lock, self._transaction():
+            self._db.execute(
+                "INSERT INTO activity (client_id, at, action, object_id, name, size, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (client_id, entry["at"], entry["action"], entry.get("object_id", ""), entry.get("name", ""),
+                 entry.get("size"), entry.get("detail", "")))
+            self._db.execute(
+                "DELETE FROM activity WHERE client_id = ? AND id <= (SELECT id FROM activity WHERE client_id = ? "
+                "ORDER BY id DESC LIMIT 1 OFFSET ?)", (client_id, client_id, keep))
+
+    def load_activity(self, client_id: str, limit: int) -> list:
+        """A client's latest entries, newest first."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT at, action, object_id, name, size, detail FROM activity WHERE client_id = ? "
+                "ORDER BY id DESC LIMIT ?", (client_id, limit)).fetchall()
+        return [{"at": r[0], "action": r[1], "object_id": r[2], "name": r[3], "size": r[4], "detail": r[5]}
+                for r in rows]
 
     def chunks_on(self, worker_id: str) -> list:
         """(object_id, chunk_id) of every copy recorded on a worker, from the

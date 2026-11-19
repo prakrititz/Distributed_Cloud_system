@@ -72,6 +72,19 @@ def save_credentials(base_url: str, client_id: str, api_key: str, path: str = No
     return path
 
 
+def ordinary_permissions(path: str) -> None:
+    """Give a finished download the permissions of any new file (0666 less
+    the umask, usually 0644). A temporary file starts readable by its owner
+    only (0600); kept that way, a download made inside the client container
+    (user 10001) could not be read on a Linux host without sudo."""
+    mask = os.umask(0)
+    os.umask(mask)
+    try:
+        os.chmod(path, 0o666 & ~mask)
+    except OSError:
+        pass
+
+
 def default_client_id() -> str:
     """Who this client is: CLIENT_ID from the environment, else the machine's
     name. It should stay the same between runs (in Docker, set CLIENT_ID: a
@@ -180,6 +193,7 @@ class Client:
                     raise ValueError(f"The download is incomplete: {received} of {length} bytes")
                 if expected and not matches(whole.hexdigest(), expected):
                     raise ValueError("Checksum mismatch: the download was damaged in transit")
+                ordinary_permissions(partial)
                 os.replace(partial, save_to)
             except BaseException:
                 os.remove(partial)

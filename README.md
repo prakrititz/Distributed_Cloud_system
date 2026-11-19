@@ -1,5 +1,8 @@
 # Mini Distributed Object Store
 
+[![tests](https://github.com/prakrititz/Distributed_Cloud_system/actions/workflows/tests.yml/badge.svg)](https://github.com/prakrititz/Distributed_Cloud_system/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A basic storage system where clients upload and retrieve files of any type
 (documents, images, video, audio, archives, other binary data). A controller
 splits each file into 1 MB chunks and stores every chunk on two different
@@ -12,6 +15,34 @@ heartbeats, corruption detection (checksums), manual and automatic repair,
 orphan cleanup, persistent metadata, and a Docker Compose deployment.
 
 **To run it and try everything yourself, see [GUIDE.md](GUIDE.md).**
+
+![On Store, the terminal dashboard](docs/demo.gif)
+
+**On Store** is a pair of terminal dashboards. Which one opens depends on the key you sign in with:
+
+- **Admin** (a key named in `ADMINS`): every worker, every chunk and where
+  its copies are, heartbeats, failures and repairs. Its keys also kill and
+  start workers, upload, corrupt a copy and repair.
+- **Client** (any other key): only that client's own files, the files other
+  clients shared with it, and its own history of uploads, downloads, changes
+  and shares. Nothing about the workers.
+
+Without a key, a sign-in portal opens. There you type a key, or **register** as
+a new client: the controller issues your key, the portal shows it once and
+saves it, and your dashboard opens.
+
+```
+pip install -r dashboard/requirements.txt
+docker compose up --build -d
+python -m dashboard --key admin-dev-key      # the admin dashboard
+python -m dashboard                          # sign in or register: your client dashboard
+```
+
+| Sign in or register | A client's dashboard |
+|---|---|
+| ![The sign-in portal](docs/portal.svg) | ![The client dashboard](docs/client-dashboard.svg) |
+
+See [dashboard/README.md](dashboard/README.md) for the screens and keys.
 
 ## Architecture
 
@@ -235,6 +266,11 @@ the system for itself:
   together, and deleting frees quota.
 
 `GET /api/v1/me` shows who the caller is, what it stores and its limits.
+`GET /api/v1/me/activity` lists what the caller did, newest first: its uploads,
+downloads, deletes, metadata changes and shares, from any program it used.
+Each client sees only its own. The latest 500 per client are kept, in the
+`activity` table of the metadata database, so they survive a restart. This
+is what the client dashboard shows as "my activity" and "downloaded".
 
 ## Metadata
 
@@ -266,6 +302,8 @@ GET /api/v1/objects/<object_id>/metadata
 | GET / PUT | `/api/v1/objects/<id>/readers` | Who else may read it: `{"readers": ["client2"]}` (`[]`: nobody). Owner only | 400, 403, 404 |
 | POST | `/api/v1/clients` | Register a new client (no key needed): `{"client_id": "..."}` (optional). 201 `{client_id, api_key}`, the key shown only once | 400 bad name, 404 registration off, 409 name taken, 429 too many from this address |
 | GET | `/api/v1/me` | Who the caller is (`registered`: a self-registered client), its stored bytes, quota and limits | |
+| GET | `/api/v1/me/activity` | What the caller did, newest first: `{at, action, object_id, name, size, detail}`, action one of upload / download / delete / metadata / share / register; `?limit=` (default 50, at most 500) | 400 |
+| GET | `/health` | The controller is up (Docker's healthcheck); needs no key | |
 | GET | `/api/v1/nodes` | Workers: up/down, capacity, used, free, chunks, seconds since the last heartbeat. Admin | 403 |
 | GET | `/api/v1/replication` | Health of every chunk and copy; `auto_repair` status. Admin | 403 |
 | POST | `/api/v1/repair` | Repair now; returns what was done. Admin | 403, 409 already running |
@@ -369,6 +407,8 @@ python -m pytest tests -m "not cluster"   # only the fast tests that start no se
 | `test_streaming.py` | streamed uploads and downloads: a bounded number of chunks at a time, raw uploads, checksum at the end, uploads and downloads cut off half-way, delete during a download, `MAX_TRANSFERS`, a 50 MB file in a few MB of memory |
 | `test_registration.py` | workers registering and re-registering, more workers joining, finding the id in Docker |
 | `test_docker_files.py` | each image's allowlist starts its program, the settings work, the compose file and Dockerfiles say what the spec requires |
+| `test_dashboard.py` | the admin dashboard: worker states, chunk health, events, heartbeat detection; the real app driven by keyboard against the cluster |
+| `test_client_dashboard.py` | each client's activity (only its own, kept across a restart); the sign-in portal (registering, a wrong key, registration off); the client dashboard driven by keyboard (own and shared files, download, share, delete, no worker internals); the admin dashboard with authentication; the key choosing the dashboard |
 
 The slower tests start four real worker processes and the API on free local
 ports and stop them afterwards.
@@ -479,3 +519,14 @@ store grows; SQLite writes only the rows a change touches. Its file is larger
   noticed and the next worker is used.
 - There is one controller: if it is down, nothing can be uploaded or downloaded
   (the data stays safe on the workers).
+
+## Contributing
+
+Contributions are welcome: bug reports, tests, docs and features. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for how to set up, run the tests and send a
+pull request. Every push and pull request runs the test suite and a Docker
+Compose end-to-end check in GitHub Actions.
+
+## License
+
+[MIT](LICENSE)
