@@ -3,6 +3,8 @@
 [![tests](https://github.com/prakrititz/Distributed_Cloud_system/actions/workflows/tests.yml/badge.svg)](https://github.com/prakrititz/Distributed_Cloud_system/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+![On Store, the terminal dashboard, watching the cluster live](docs/on-store.gif)
+
 A basic storage system where clients upload and retrieve files of any type
 (documents, images, video, audio, archives, other binary data). A controller
 splits each file into 1 MB chunks and stores every chunk on two different
@@ -15,8 +17,6 @@ heartbeats, corruption detection (checksums), manual and automatic repair,
 orphan cleanup, persistent metadata, and a Docker Compose deployment.
 
 **To run it and try everything yourself, see [GUIDE.md](GUIDE.md).**
-
-![On Store, the terminal dashboard](docs/demo.gif)
 
 **On Store** is a pair of terminal dashboards. Which one opens depends on the key you sign in with:
 
@@ -38,9 +38,11 @@ python -m dashboard --key admin-dev-key      # the admin dashboard
 python -m dashboard                          # sign in or register: your client dashboard
 ```
 
-| Sign in or register | A client's dashboard |
+| The admin dashboard | A client's dashboard |
 |---|---|
-| ![The sign-in portal](docs/portal.svg) | ![The client dashboard](docs/client-dashboard.svg) |
+| ![On Store: the admin dashboard](docs/on-store-admin.png) | ![On Store: a client's dashboard](docs/on-store-client.png) |
+
+![On Store: sign in or register](docs/on-store-sign-in.png)
 
 See [dashboard/README.md](dashboard/README.md) for the screens and keys.
 

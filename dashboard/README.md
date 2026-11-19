@@ -14,7 +14,7 @@ python -m dashboard --flow                    # admin: open on the flow screen
 python -m dashboard --api http://127.0.0.1:5000   # another controller address
 ```
 
-![On Store, the admin dashboard, live](../docs/demo.gif)
+![On Store, the admin dashboard, live](../docs/on-store.gif)
 
 Use a real terminal (Windows Terminal, the VS Code terminal) at least 140 x 40 characters. `q` quits the dashboard; the system keeps running.
 
@@ -36,7 +36,7 @@ Where the key comes from: `--key`, else `API_KEY`, else the key saved for this c
 
 ## The sign-in portal
 
-![The sign-in portal](../docs/portal.svg)
+![On Store: sign in or register](../docs/on-store-sign-in.png)
 
 It opens when there is no key that works:
 
@@ -47,7 +47,7 @@ Registration answers you may see: the name is taken (choose another), registrati
 
 ## Admin screens
 
-![The admin dashboard](../docs/admin-dashboard.svg)
+![On Store: the admin dashboard](../docs/on-store-admin.png)
 
 - **1 Overview**
   - Workers: state, chunks, heartbeat age, usage, orphans.
@@ -80,7 +80,7 @@ Everything is real. Heartbeats are found from the heartbeat ages in `GET /nodes`
 
 ## The client dashboard
 
-![The client dashboard: client1's files, a file shared by client2, and its activity](../docs/client-dashboard.svg)
+![On Store: client1's dashboard, with its files, a file shared by client2, and its activity](../docs/on-store-client.png)
 
 - **My files**: name, size, type, upload time. `↓` marks the ones you have downloaded.
 - **Shared with me**: files other clients let you read, and whose they are.
