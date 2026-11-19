@@ -99,3 +99,47 @@ class TestHealthEndpoint:
         put(cluster, "t-0", b"x" * 1000)
         after = requests.get(f"{cluster.node_url(NODE)}/internal/health", timeout=TIMEOUT).json()
         assert after["used"] == 1000 and after["free"] == before["free"] - 1000 and after["chunks"] == 1
+
+
+def test_the_heartbeat_thread_survives_an_unexpected_error(tmp_path, monkeypatch):
+    """An error other than a network one (here: counting the disk space
+    fails) must not stop the heartbeats: without them the controller counts a
+    worker down that still works."""
+    import importlib
+    import sys
+    import threading
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "w"))
+    monkeypatch.setenv("NODE_ID", "worker9")
+    sys.modules.pop("nodes.node_server", None)
+    server = importlib.import_module("nodes.node_server")
+    monkeypatch.setattr(server, "HEARTBEAT_INTERVAL", 0.01)
+    sent, calls = [], {"n": 0}
+
+    class Ok:
+        status_code = 200
+
+    def post(url, json=None, timeout=None):
+        sent.append(url.rsplit("/", 1)[-1])
+        return Ok()
+
+    def space_report():
+        calls["n"] += 1
+        if calls["n"] in (2, 3):                     # the 1st heartbeat after registering, and the next
+            raise FileNotFoundError("a chunk vanished while counting")
+        return {"worker_id": "worker9", "capacity": 1, "used": 0, "free": 1, "chunks": 0}
+    monkeypatch.setattr(server.requests, "post", post)
+    monkeypatch.setattr(server, "space_report", space_report)
+    stop = threading.Event()
+    t = threading.Thread(target=server.send_heartbeats, args=(stop,), daemon=True)
+    t.start()
+    try:
+        for _ in range(200):
+            if sent.count("heartbeat") >= 3:
+                break
+            threading.Event().wait(0.01)
+    finally:
+        stop.set()
+        t.join(2)
+        sys.modules.pop("nodes.node_server", None)
+    assert sent[0] == "register" and sent.count("heartbeat") >= 3 and calls["n"] >= 5
+    assert not t.is_alive()

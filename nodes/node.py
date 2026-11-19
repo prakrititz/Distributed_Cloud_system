@@ -126,8 +126,23 @@ class ChunkStore:
     def used_space(self) -> int:
         """Total bytes of chunk data on disk (temp files included, so space
         being written right now is counted). The tiny checksum files are not
-        counted."""
-        return sum(e.stat().st_size for e in os.scandir(self.data_dir) if e.is_file())
+        counted.
+
+        A file can vanish between listing the folder and reading its size: a
+        temp file renamed into place, or a chunk deleted. On Linux reading its
+        size then raises FileNotFoundError (Windows gets the sizes with the
+        listing). Such a file is skipped: it is being written or deleted, and
+        the next report counts it right. (Not skipping it once killed the
+        heartbeat thread: the worker kept serving but the controller counted
+        it down.)"""
+        total = 0
+        for entry in os.scandir(self.data_dir):
+            try:
+                if entry.is_file():
+                    total += entry.stat().st_size
+            except FileNotFoundError:
+                continue
+        return total
 
     def free_space(self) -> int:
         """capacity - used_space."""

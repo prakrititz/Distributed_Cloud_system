@@ -201,8 +201,9 @@ def space_report() -> dict:
     }
 
 
-def send_heartbeats() -> None:
-    """Runs forever in a background thread.
+def send_heartbeats(stop: threading.Event = None) -> None:
+    """Runs forever in a background thread (until `stop` is set, if given:
+    the tests use that).
 
     First REGISTER (POST /internal/workers/register with this worker's id and
     address), so the controller knows it exists. Then every
@@ -214,7 +215,7 @@ def send_heartbeats() -> None:
     base = CONTROLLER_URL.rstrip("/")
     registered = False
     connected = None   # only to print when the state changes
-    while True:
+    while stop is None or not stop.is_set():
         try:
             if not registered:
                 response = requests.post(base + "/internal/workers/register",
@@ -232,10 +233,19 @@ def send_heartbeats() -> None:
                 now_connected = response.status_code == 200
         except requests.RequestException:
             now_connected = False
+        except Exception as e:
+            # Anything else (a disk error while counting space, ...): say so and
+            # try again next round. This thread must never die: without
+            # heartbeats the controller counts a worker down that still works.
+            print(f"[{NODE_ID}] heartbeat failed: {type(e).__name__}: {e}; trying again", flush=True)
+            now_connected = False
         if now_connected != connected:
             connected = now_connected
             print(f"[{NODE_ID}] controller {base}: " + ("connected" if connected else "not reachable, retrying"))
-        time.sleep(HEARTBEAT_INTERVAL)
+        if stop is not None:
+            stop.wait(HEARTBEAT_INTERVAL)
+        else:
+            time.sleep(HEARTBEAT_INTERVAL)
 
 
 if __name__ == "__main__":

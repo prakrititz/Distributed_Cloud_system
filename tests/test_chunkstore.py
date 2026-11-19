@@ -215,3 +215,55 @@ class TestSafety:
         assert not (data_dir / ".tmp-half-written").exists()
         assert not (data_dir / ".checksums" / ".tmp-half").exists()
         assert s.chunk_count() == 0
+
+
+class TestCountingWhileFilesChange:
+    """used_space() lists the folder, then reads each file's size. A file
+    renamed (a write finishing) or deleted in between made it raise
+    FileNotFoundError on Linux, which killed the heartbeat thread: the worker
+    kept serving, but the controller counted it down. The flaky "worker1 did
+    not come up" in CI."""
+
+    def test_a_file_that_vanishes_is_skipped(self, store, monkeypatch):
+        import nodes.node as node_module
+        store.store("a", b"1234")
+        store.store("b", b"56")
+        real_scandir = os.scandir
+
+        class Vanished:
+            name = "gone"
+            def is_file(self):
+                return True
+            def stat(self):
+                raise FileNotFoundError("renamed or deleted since the listing")
+
+        def scandir(path):
+            return iter(list(real_scandir(path)) + [Vanished()])
+        monkeypatch.setattr(node_module.os, "scandir", scandir)
+        assert store.used_space() == 6 and store.free_space() == 994
+
+    def test_while_chunks_are_stored_and_deleted(self, tmp_path):
+        store = ChunkStore(str(tmp_path / "busy"), capacity=10 ** 9)
+        stop = threading.Event()
+        failures = []
+
+        def churn(n):
+            i = 0
+            while not stop.is_set():
+                store.store(f"c{n}-{i % 20}", os.urandom(4096))
+                store.delete(f"c{n}-{(i + 10) % 20}")
+                i += 1
+        threads = [threading.Thread(target=churn, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        try:
+            for _ in range(3000):
+                try:
+                    assert store.used_space() >= 0
+                except FileNotFoundError as e:       # (on Linux, about 1 call in 10 before the fix)
+                    failures.append(e)
+        finally:
+            stop.set()
+            for t in threads:
+                t.join()
+        assert failures == []
