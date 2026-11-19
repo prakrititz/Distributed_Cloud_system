@@ -50,6 +50,7 @@ Registration answers you may see: the name is taken (choose another), registrati
 ![The admin dashboard](../docs/admin-dashboard.svg)
 
 - **1 Overview**
+  - Top bar: workers up, objects and chunks, overall health, auto-repair, the chunk cache's hit rate and memory use.
   - Workers: state, chunks, heartbeat age, usage, orphans.
   - Chunk map: each object's chunks, one coloured block per copy.
   - Selected object and chunk.
