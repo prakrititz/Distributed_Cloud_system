@@ -30,6 +30,47 @@ from helpers.checksum import compute, compute_file, matches, running
 BASE_URL = os.environ.get("API_URL", "http://127.0.0.1:5000/api/v1")
 BLOCK = 1024 * 1024   # bytes read or written at a time while streaming
 
+# Where a key this client got by registering is kept: a small JSON file,
+# readable only by its owner, with one entry per API address (the format idea
+# of ~/.aws/credentials). Override with OBJECTSTORE_CREDENTIALS.
+CREDENTIALS = os.environ.get("OBJECTSTORE_CREDENTIALS") or os.path.join(
+    os.path.expanduser("~"), ".objectstore", "credentials.json")
+
+
+def load_credentials(base_url: str, path: str = None):
+    """(client_id, api_key) saved for this API address, or (None, None)."""
+    try:
+        with open(path or CREDENTIALS, encoding="utf-8") as f:
+            entry = json.load(f).get(base_url) or {}
+        return entry.get("client_id"), entry.get("api_key")
+    except (OSError, ValueError, AttributeError):
+        return None, None
+
+
+def save_credentials(base_url: str, client_id: str, api_key: str, path: str = None) -> str:
+    """Remember the key for this API address. The file is created readable
+    and writable by its owner only (on Windows the user's own folder already
+    keeps it private). Returns the file's path."""
+    path = path or CREDENTIALS
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    try:
+        with open(path, encoding="utf-8") as f:
+            saved = json.load(f)
+        if not isinstance(saved, dict):
+            saved = {}
+    except (OSError, ValueError):
+        saved = {}
+    saved[base_url] = {"client_id": client_id, "api_key": api_key}
+    fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(saved, f, indent=1)
+    os.replace(path + ".tmp", path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
 
 def default_client_id() -> str:
     """Who this client is: CLIENT_ID from the environment, else the machine's
@@ -42,9 +83,17 @@ class Client:
     def __init__(self, base_url: str = BASE_URL, client_id: str = None, api_key: str = None):
         self.base_url = base_url
         self.client_id = client_id or default_client_id()
-        # With authentication, every request carries this client's secret key
-        # (API_KEY), and the server knows from it who we are.
-        self.api_key = api_key if api_key is not None else os.environ.get("API_KEY", "").strip()
+        # With authentication, every request carries this client's secret key,
+        # and the server knows from it who we are: the one given here, else
+        # API_KEY, else the key saved when this client registered itself.
+        if api_key is None:
+            api_key = os.environ.get("API_KEY", "").strip()
+            if not api_key:
+                saved_id, saved_key = load_credentials(self.base_url)
+                if saved_key:
+                    api_key = saved_key
+                    self.client_id = client_id or saved_id
+        self.api_key = api_key
 
     def _headers(self, extra: dict = None) -> dict:
         headers = dict(extra or {})
@@ -166,6 +215,20 @@ class Client:
         self._check(response)
         return response.json()
 
+    def register(self, client_id: str = None, save: bool = True) -> dict:
+        """Register this client with the controller and get its own API key
+        (shown only this once). Without a name, the controller makes one up.
+        The key is saved in the credentials file (unless save=False) and used
+        from then on. Returns {client_id, api_key, message}."""
+        response = requests.post(f"{self.base_url}/clients",
+                                 json={"client_id": client_id} if client_id else {})
+        self._check(response)
+        answer = response.json()
+        self.client_id, self.api_key = answer["client_id"], answer["api_key"]
+        if save:
+            answer["saved_to"] = save_credentials(self.base_url, self.client_id, self.api_key)
+        return answer
+
     def share(self, object_id: str, readers: list) -> dict:
         """Set which other clients may read one of our objects ([] stops
         sharing). Returns {object_id, owner, readers}."""
@@ -211,9 +274,12 @@ python client.py update OBJECT_ID k=v,k2=null  change custom metadata (null remo
 python client.py delete OBJECT_ID              delete an object
 python client.py share OBJECT_ID client2,client3   let other clients read it (share OBJECT_ID - : nobody)
 python client.py me                            who the server says you are, your storage and limits
+python client.py register [NAME]               get your own API key from the controller (saved for you)
 
 Settings: API_URL (default http://127.0.0.1:5000/api/v1), CLIENT_ID, and API_KEY
-(this client's secret key, when the server requires one)."""
+(this client's secret key, when the server requires one; without it, the key
+saved by `register` is used, from OBJECTSTORE_CREDENTIALS or
+~/.objectstore/credentials.json)."""
 
 
 def run_command(client: "Client", args: list) -> int:
@@ -221,7 +287,7 @@ def run_command(client: "Client", args: list) -> int:
     scripts). Prints the result; returns the exit code (0 ok, 1 error, 2 bad usage)."""
     command, rest = args[0], args[1:]
     arity = {"upload": (1, 2), "download": (1, 2), "list": (0, 0), "info": (1, 1),
-             "update": (2, 2), "delete": (1, 1), "share": (2, 2), "me": (0, 0)}
+             "update": (2, 2), "delete": (1, 1), "share": (2, 2), "me": (0, 0), "register": (0, 1)}
     if command not in arity or not arity[command][0] <= len(rest) <= arity[command][1]:
         print(USAGE)
         return 2
@@ -254,6 +320,11 @@ def run_command(client: "Client", args: list) -> int:
             print(f"Readers of {shared['object_id']}: {', '.join(shared['readers']) or 'nobody'}")
         elif command == "me":
             print(json.dumps(client.me(), indent=2))
+        elif command == "register":
+            answer = client.register(rest[0] if rest else None)
+            print(f"Registered as '{answer['client_id']}'.")
+            print(f"Your API key (shown only this once): {answer['api_key']}")
+            print(f"Saved to {answer['saved_to']}; this client uses it from now on.")
         return 0
     except (OSError, ValueError, requests.RequestException) as e:
         print(f"Error: {e}")

@@ -26,6 +26,7 @@ x-settings:
   api_keys:           &api_keys           ${API_KEYS:-client1=client1-dev-key,client2=client2-dev-key,admin=admin-dev-key}
   admins:             &admins             ${ADMINS:-admin}
   quota_per_client:   &quota_per_client   ${QUOTA_PER_CLIENT:-0}       # bytes each client may store (0: no limit)
+  allow_registration: &allow_registration ${ALLOW_REGISTRATION:-1}     # new clients may register themselves (0: no)
 # -------------------------------------------------------------------------
 #
 # How it fits together:
@@ -70,6 +71,7 @@ services:
       API_KEYS: *api_keys
       ADMINS: *admins
       QUOTA_PER_CLIENT: *quota_per_client
+      ALLOW_REGISTRATION: *allow_registration
     ports:
       - target: 5000
         published: *api_port

@@ -856,6 +856,10 @@ class Distributor:
     # ------------------------------------------------------------------
     # per-client storage (quotas) and sharing
     # ------------------------------------------------------------------
+    def owns_objects(self, client_id: str) -> bool:
+        """True if any stored object belongs to this client id."""
+        return any(m.client_id == client_id for m in list(self.metadata.values()))
+
     def used_bytes(self, client_id: str) -> int:
         """Bytes stored by this client, plus its uploads still arriving."""
         with self._lock:

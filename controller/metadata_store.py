@@ -21,6 +21,11 @@ apply(metadata, objects=(), removed=(), chunks=()) is called after every
 change, with the distributor's full metadata (object_id -> ObjectMetadata) and
 what changed: object ids added or replaced, object ids deleted, and ChunkInfos
 whose list of copies changed (repair, cleanup).
+
+The stores also keep the clients that registered themselves (see
+controller/access.py, ClientRegistry): load_clients() -> [(client_id,
+key_hash)], add_client(client_id, key_hash, created_at) (ValueError if the id
+or the hash is taken). Only a hash of each key is ever stored.
 """
 import json
 import os
@@ -35,11 +40,26 @@ def _as_dict(obj) -> dict:
     return obj if isinstance(obj, dict) else asdict(obj)
 
 
+class ClientTaken(ValueError):
+    """A client id (or key hash) that is already registered."""
+
+
 class MemoryStore:
     persistent = False
 
+    def __init__(self):
+        self._clients = {}          # client_id -> key_hash (lost on restart, like everything here)
+
     def load(self) -> list:
         return []
+
+    def load_clients(self) -> list:
+        return list(self._clients.items())
+
+    def add_client(self, client_id: str, key_hash: str, created_at: str) -> None:
+        if client_id in self._clients or key_hash in self._clients.values():
+            raise ClientTaken(client_id)
+        self._clients[client_id] = key_hash
 
     def apply(self, metadata: dict, objects=(), removed=(), chunks=()) -> None:
         pass
@@ -57,6 +77,7 @@ class JsonFileStore:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.Lock()   # one save at a time
+        self._clients = None            # registered clients, read from the file when first needed
 
     def load(self) -> list:
         """The saved objects as a list of plain dicts ([] if nothing was saved
@@ -71,15 +92,39 @@ class JsonFileStore:
             raise ValueError(f"Cannot read the metadata file {self.path}: {e}") from None
         if not isinstance(doc, dict) or doc.get("version") != FORMAT_VERSION or not isinstance(doc.get("objects"), list):
             raise ValueError(f"The metadata file {self.path} is not in the expected format")
+        self._clients = list(doc.get("clients", []))
         return doc["objects"]
+
+    def _known_clients(self) -> list:
+        if self._clients is None:
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    self._clients = list(json.load(f).get("clients", []))
+            except (OSError, ValueError, AttributeError):
+                self._clients = []
+        return self._clients
+
+    def load_clients(self) -> list:
+        return [(c["client_id"], c["key_hash"]) for c in self._known_clients()]
+
+    def add_client(self, client_id: str, key_hash: str, created_at: str) -> None:
+        """Add a client and write the file again (with the objects it holds)."""
+        objects = self.load() if os.path.exists(self.path) else []   # (re-reads the clients too)
+        clients = self._known_clients()
+        if any(c["client_id"] == client_id or c["key_hash"] == key_hash for c in clients):
+            raise ClientTaken(client_id)
+        clients.append({"client_id": client_id, "key_hash": key_hash, "created_at": created_at})
+        self.save(objects)
 
     def apply(self, metadata: dict, objects=(), removed=(), chunks=()) -> None:
         """Whatever changed, the whole file is written again."""
         self.save(list(metadata.values()))
 
     def save(self, objects: list) -> None:
-        """Write every object (ObjectMetadata or dicts) atomically."""
-        doc = {"version": FORMAT_VERSION, "objects": [_as_dict(o) for o in objects]}
+        """Write every object (ObjectMetadata or dicts) and the registered
+        clients atomically."""
+        doc = {"version": FORMAT_VERSION, "objects": [_as_dict(o) for o in objects],
+               "clients": self._known_clients()}
         text = json.dumps(doc, indent=1, sort_keys=True)
         with self._lock:
             os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)   # on first save
@@ -143,6 +188,12 @@ CREATE TABLE IF NOT EXISTS replicas (
 );
 -- "which chunks are on worker3?" without reading everything
 CREATE INDEX IF NOT EXISTS replicas_by_worker ON replicas (worker_id);
+-- clients that registered themselves: only a hash of each key is kept
+CREATE TABLE IF NOT EXISTS clients (
+    client_id  TEXT PRIMARY KEY,
+    key_hash   TEXT NOT NULL UNIQUE,                -- SHA-256 of the key, hex; looked up on every request
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -208,6 +259,20 @@ class SqliteStore:
                     "SELECT object_id, name, size, checksum, content_type, created_at, modified_at, "
                     "source_path, client_id, custom, readers FROM objects ORDER BY created_at, object_id")
             ]
+
+    def load_clients(self) -> list:
+        """[(client_id, key_hash)] of every registered client."""
+        with self._lock:
+            return self._db.execute("SELECT client_id, key_hash FROM clients ORDER BY created_at").fetchall()
+
+    def add_client(self, client_id: str, key_hash: str, created_at: str) -> None:
+        """Register a client. Raises ClientTaken if the id (or the hash) exists."""
+        try:
+            with self._lock, self._transaction():
+                self._db.execute("INSERT INTO clients (client_id, key_hash, created_at) VALUES (?, ?, ?)",
+                                 (client_id, key_hash, created_at))
+        except sqlite3.IntegrityError:
+            raise ClientTaken(client_id) from None
 
     def chunks_on(self, worker_id: str) -> list:
         """(object_id, chunk_id) of every copy recorded on a worker, from the

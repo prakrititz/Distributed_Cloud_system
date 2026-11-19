@@ -14,6 +14,7 @@ import json
 import math
 import mimetypes
 import os
+import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -21,10 +22,11 @@ from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, Response, g, request, jsonify
 from werkzeug.exceptions import HTTPException
 
-from config import (ADMINS, API_KEYS, AUTO_REPAIR_GRACE, CHUNK_SIZE, HEARTBEAT_INTERVAL, MAX_TRANSFERS,
-                    MAX_TRANSFERS_PER_CLIENT, METADATA_PATH, NODE_ADDRESSES, ORPHAN_MIN_AGE, QUOTA_PER_CLIENT,
-                    RATE_BURST, RATE_PER_CLIENT, REPLICATION_FACTOR)
-from controller.access import ClientSlots, KeyRing, RateLimiter
+from config import (ADMINS, ALLOW_REGISTRATION, API_KEYS, AUTH_REQUIRED, AUTO_REPAIR_GRACE, CHUNK_SIZE,
+                    HEARTBEAT_INTERVAL, MAX_TRANSFERS, MAX_TRANSFERS_PER_CLIENT, METADATA_PATH, NODE_ADDRESSES,
+                    ORPHAN_MIN_AGE, QUOTA_PER_CLIENT, RATE_BURST, RATE_PER_CLIENT, REGISTRATIONS_PER_MINUTE,
+                    REPLICATION_FACTOR)
+from controller.access import CLIENT_ID_PATTERN, ClientRegistry, ClientSlots, KeyRing, RateLimiter
 from controller.distributor import DEFAULT_CONTENT_TYPE, Distributor
 from controller.metadata_store import store_from_setting
 from controller.remote_node import RemoteNode
@@ -69,7 +71,10 @@ transfers = TransferSlots(MAX_TRANSFERS)
 # With no API_KEYS, keyring.enabled is False: no authentication, and none of
 # the per-client limits below apply (without authentication a client_id is
 # only a claim, so there is nobody to be fair between).
-keyring = KeyRing.from_setting(API_KEYS, ADMINS)
+keyring = KeyRing.from_setting(API_KEYS, ADMINS, required=AUTH_REQUIRED,
+                               registry=ClientRegistry(distributor.store))   # + clients that registered themselves
+allow_registration = ALLOW_REGISTRATION
+registration_limiter = RateLimiter(REGISTRATIONS_PER_MINUTE / 60, REGISTRATIONS_PER_MINUTE)   # per network address
 rate_limiter = RateLimiter(RATE_PER_CLIENT, RATE_BURST)    # requests per second per client
 client_slots = ClientSlots(MAX_TRANSFERS_PER_CLIENT)        # transfers at once per client
 quota_per_client = QUOTA_PER_CLIENT                         # bytes per client (0: no quota)
@@ -108,9 +113,12 @@ def give_back_transfer_slots(client) -> None:
 # ---------------------------------------------------------------------------
 # Authentication and access rules
 # ---------------------------------------------------------------------------
-def protected(path: str) -> bool:
-    """The client API needs a key; so does a worker's chunk inventory (an
-    operator tool). The other /internal endpoints are for the workers."""
+def protected(path: str, method: str = "GET") -> bool:
+    """The client API needs a key, except registering (that is how a client
+    gets one); so does a worker's chunk inventory (an operator tool). The
+    other /internal endpoints are for the workers."""
+    if path == "/api/v1/clients" and method == "POST":
+        return False
     return path.startswith("/api/") or (path.startswith("/internal/workers/") and path.endswith("/chunks"))
 
 
@@ -119,7 +127,7 @@ def authenticate():
     """Find out who is calling (from 'Authorization: Bearer <key>') and apply
     the client's request rate. Without API_KEYS everyone may do everything."""
     g.client, g.admin = None, True
-    if not keyring.enabled or not protected(request.path):
+    if not keyring.enabled or not protected(request.path, request.method):
         return None
     client = keyring.identify(request.headers.get("Authorization"))
     if client is None:
@@ -562,6 +570,54 @@ def put_readers(object_id):
     return jsonify({"object_id": meta.object_id, "owner": meta.client_id, "readers": meta.readers})
 
 
+@app.route("/api/v1/clients", methods=["POST"])
+def register_client():
+    """A new client registers itself and gets its own API key. No key is
+    needed for this. Body (optional): {"client_id": "client7"}, the name it
+    wants (letters, digits, . _ -, at most 64); without one, a name is made up.
+
+    201 {"client_id", "api_key"}: the key is shown only this once; the
+    controller keeps only its hash, so a lost key cannot be recovered. 400
+    for a bad name, 404 when registration is off (no authentication, or
+    ALLOW_REGISTRATION=0), 409 if the name is taken (a fixed client, an
+    admin, a registered client, or the owner of stored objects), 429 after
+    too many registrations from one network address."""
+    if not keyring.enabled or not allow_registration or keyring.registry is None:
+        return error("Registration is off on this controller", 404)
+    allowed, wait = registration_limiter.allow(request.remote_addr or "unknown")
+    if not allowed:
+        response, status = error("Too many registrations from this address. Try again later", 429)
+        response.headers["Retry-After"] = str(max(1, math.ceil(wait)))
+        return response, status
+
+    body = request.get_json(silent=True)
+    if body is not None and not isinstance(body, dict):
+        return error("The body must be a JSON object, e.g. {\"client_id\": \"client7\"}", 400)
+    client_id = (body or {}).get("client_id")
+    if client_id is None:
+        client_id = "client-" + secrets.token_hex(4)                 # no name asked for: make one up
+        while keyring.taken(client_id):
+            client_id = "client-" + secrets.token_hex(4)
+    if not isinstance(client_id, str) or not CLIENT_ID_PATTERN.match(client_id):
+        return error("'client_id' must be 1-64 letters, digits, '.', '_' or '-', starting with a letter or digit",
+                     400)
+    # A name that already means someone must never be handed out again: that
+    # would give the newcomer their rights (an admin) or their objects (an
+    # owner from before authentication was on).
+    if keyring.taken(client_id) or distributor.owns_objects(client_id):
+        return error(f"The client id '{client_id}' is taken; choose another", 409)
+    try:
+        key = keyring.registry.register(client_id, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    except ValueError:                                                # registered a moment ago by someone else
+        return error(f"The client id '{client_id}' is taken; choose another", 409)
+    print(f"[controller] client {client_id} registered itself", flush=True)
+    return jsonify({
+        "client_id": client_id,
+        "api_key": key,
+        "message": "Keep this key safe: it is shown only this once. Send it as 'Authorization: Bearer <key>'.",
+    }), 201
+
+
 @app.route("/api/v1/me", methods=["GET"])
 def who_am_i():
     """Who the caller is and what it may use: its client id, whether it is an
@@ -571,6 +627,7 @@ def who_am_i():
     return jsonify({
         "client_id": client,
         "authenticated": keyring.enabled,
+        "registered": bool(client and keyring.registry is not None and keyring.registry.known(client)),
         "admin": bool(g.admin),
         "stored_bytes": distributor.used_bytes(client or ""),
         "quota_bytes": quota_per_client if keyring.enabled and quota_per_client and not g.admin else None,

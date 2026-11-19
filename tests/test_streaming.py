@@ -100,15 +100,27 @@ class TestStreamingUpload:
         d, nodes = make_distributor(chunk_size=100, parallel_chunks=parallel)
         data = os.urandom(1000)
         stream = Recorder(data)
-        read_when_stored = {}
+        copies, lock, worst = {}, threading.Lock(), [0]
+
+        def stored(chunk_id):
+            with lock:
+                copies[chunk_id] = copies.get(chunk_id, 0) + 1
+
         for n in nodes:
-            n.on_store = lambda chunk_id: read_when_stored.setdefault(chunk_id, stream.pos)
+            n.on_store = stored
+        real_read = stream.read
+
+        def read(n):
+            # chunks read from the stream so far, minus those fully stored (both copies)
+            with lock:
+                done = sum(1 for c in copies.values() if c >= 2)
+            worst[0] = max(worst[0], stream.pos // 100 - done)
+            return real_read(n)
+        stream.read = read
         oid = d.upload("f", stream)
-        for info in d.get_object(oid).chunks:
-            # when a chunk's first copy was stored, at most `parallel` chunks
-            # had been read from the stream (this one and the ones in flight);
-            # with 1, nothing after it had been read
-            assert read_when_stored[info.chunk_id] <= (info.index + parallel) * 100
+        # never more than `parallel` chunks read and not yet stored; with 1,
+        # a chunk is stored before the next is read
+        assert worst[0] <= parallel
         assert d.download(oid) == data
 
     def test_short_reads_still_give_full_chunks(self, make_distributor):

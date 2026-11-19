@@ -189,7 +189,36 @@ object has an owner (the client that uploaded it) and optionally readers:
 | anyone else | nothing: the object answers 404, exactly as if it did not exist, and is not listed |
 
 Without `API_KEYS` there is no authentication: everyone may do everything, as
-before. The workers' own endpoints (registration, heartbeats) need no key.
+before (`AUTH=1` turns it on with no fixed keys at all). The workers' own
+endpoints (registration, heartbeats) need no key.
+
+**Clients register themselves:** with authentication on, a new client needs no
+key from anyone. It asks the controller for an account and gets its own key:
+
+```
+python client.py register client7          # or without a name: one is made up
+Registered as 'client7'.
+Your API key (shown only this once): sk_Xq3…
+Saved to ~/.objectstore/credentials.json; this client uses it from now on.
+python client.py upload notes.txt          # as client7
+```
+
+- `POST /api/v1/clients` (`{"client_id": "client7"}`, optional) needs no key.
+  The controller creates a random key, returns it **once**, and keeps only its
+  SHA-256 hash (in the `clients` table of the metadata database), so a lost key
+  cannot be recovered. Registrations survive a restart.
+- A name that already means someone is refused (409): a client of `API_KEYS`, an
+  admin, a registered client, or the owner of stored objects. Otherwise
+  registering as `admin`, or as the owner of older objects, would hand over
+  their rights or their files.
+- At most `REGISTRATIONS_PER_MINUTE` (10) registrations per network address
+  (429 beyond), so one script cannot create thousands of accounts.
+- A registered client is like any other: it sees only its own objects and has
+  its own fair share. `client.py` keeps the key in
+  `~/.objectstore/credentials.json` (readable only by its owner; one entry per
+  API address; override with `OBJECTSTORE_CREDENTIALS`); `API_KEY`, when set,
+  wins.
+- `ALLOW_REGISTRATION=0` turns it off.
 
 **A fair share for every client:** with authentication, no client can take
 the system for itself:
@@ -235,7 +264,8 @@ GET /api/v1/objects/<object_id>/metadata
 | PATCH | `/api/v1/objects/<id>/metadata` | Add/update custom metadata (`null` removes a key). Owner only | 400, 403, 404 |
 | DELETE | `/api/v1/objects/<id>` | Delete the object and all copies, 204. Owner only | 403, 404 |
 | GET / PUT | `/api/v1/objects/<id>/readers` | Who else may read it: `{"readers": ["client2"]}` (`[]`: nobody). Owner only | 400, 403, 404 |
-| GET | `/api/v1/me` | Who the caller is, its stored bytes, quota and limits | |
+| POST | `/api/v1/clients` | Register a new client (no key needed): `{"client_id": "..."}` (optional). 201 `{client_id, api_key}`, the key shown only once | 400 bad name, 404 registration off, 409 name taken, 429 too many from this address |
+| GET | `/api/v1/me` | Who the caller is (`registered`: a self-registered client), its stored bytes, quota and limits | |
 | GET | `/api/v1/nodes` | Workers: up/down, capacity, used, free, chunks, seconds since the last heartbeat. Admin | 403 |
 | GET | `/api/v1/replication` | Health of every chunk and copy; `auto_repair` status. Admin | 403 |
 | POST | `/api/v1/repair` | Repair now; returns what was done. Admin | 403, 409 already running |
@@ -290,10 +320,14 @@ In Docker they are at the top of `docker-compose.yml` (see [GUIDE.md](GUIDE.md))
 | `MAX_TRANSFERS` | 32 | controller | uploads and downloads at once; more get 503 |
 | `API_KEYS` | empty (Docker: development keys for client1, client2, admin) | controller | `client=key,...`: one secret key per client; empty = no authentication |
 | `ADMINS` | admin | controller | clients that may do everything (repair, cleanup, every object) |
+| `AUTH` | off | controller | `1`: authentication on even without `API_KEYS` (every client registers itself) |
+| `ALLOW_REGISTRATION` | 1 | controller | new clients may register themselves (with authentication on); `0`: no |
+| `REGISTRATIONS_PER_MINUTE` | 10 | controller | registrations per network address per minute |
 | `MAX_TRANSFERS_PER_CLIENT` | 8 | controller | uploads and downloads of one client at once (with authentication) |
 | `RATE_PER_CLIENT`, `RATE_BURST` | 20, 40 | controller | requests per second of one client, and its burst; 0 = no limit (with authentication) |
 | `QUOTA_PER_CLIENT` | 0 | controller | bytes one client may store; 0 = no limit (with authentication; admins have none) |
-| `API_KEY` | empty (Docker: the client's key) | client | the key `client.py` sends |
+| `API_KEY` | empty (Docker: the client's key) | client | the key `client.py` sends; without it, the key saved by `register` |
+| `OBJECTSTORE_CREDENTIALS` | ~/.objectstore/credentials.json | client | where `register` saves the key |
 | `PARALLEL_CHUNKS` | 4 | controller | chunks moving at once within one upload or download (memory: about this many chunks per transfer) |
 | `WORKER_CONNECTIONS` | 32 | controller | open connections kept per worker and reused |
 | `WORKER_THREADS` | 32 | worker | requests a worker answers at the same time (waitress threads) |
@@ -329,6 +363,7 @@ python -m pytest tests -m "not cluster"   # only the fast tests that start no se
 | `test_multi_client.py` | several clients at once: same paths, races, parallel patches and deletes |
 | `test_client.py` | the client: menu, commands, original bytes on download |
 | `test_auth.py` | keys and 401, each client sees and changes only its own objects (404 for others'), sharing and readers, admin-only endpoints, the client program with a key; a fair share: per-client transfers (503), request rate (429), quota (413, also part-way and for uploads at the same time) |
+| `test_client_registration.py` | clients registering themselves: a key that works, only its hash stored, names that are taken (fixed clients, admins, registered clients, owners of objects), bad names, the registration rate, registered clients isolated from each other, the credentials file, every store keeping registrations |
 | `test_connections.py` | reused connections: one connection for many requests to a worker, many threads sharing a pool, a dead worker still noticed and a restarted one reused, a worker usable as soon as it counts as alive |
 | `test_parallel.py` | several chunks in flight: copies written at the same time, at most `PARALLEL_CHUNKS` at once, chunks finishing out of order, a failure or bad checksum with chunks in flight, downloads fetched ahead but sent in order, an abandoned download fetching nothing more |
 | `test_streaming.py` | streamed uploads and downloads: a bounded number of chunks at a time, raw uploads, checksum at the end, uploads and downloads cut off half-way, delete during a download, `MAX_TRANSFERS`, a 50 MB file in a few MB of memory |
@@ -423,6 +458,9 @@ store grows; SQLite writes only the rows a change touches. Its file is larger
   `API_KEYS`, `CLIENT1_KEY`, `CLIENT2_KEY` in a `.env` file.
 - The workers' endpoints (registration, heartbeats) need no key: anything that
   can reach the controller's port can register as a worker.
+- Anyone who can reach the controller can register a client (limited per
+  address). There is no way yet to revoke or replace a key; a lost key means
+  registering a new client.
 - The per-client limits apply only with authentication (without it a
   `client_id` is just a claim).
 
