@@ -16,6 +16,19 @@ import requests
 BLOCK = 1024 * 1024        # bytes read or written at a time while streaming
 
 
+def ordinary_permissions(path: str) -> None:
+    """Give a finished download the permissions of any new file (0666 less
+    the umask, usually 0644). A temporary file starts readable by its owner
+    only (0600); kept that way, other users of a Linux machine could not
+    read the download."""
+    mask = os.umask(0)
+    os.umask(mask)
+    try:
+        os.chmod(path, 0o666 & ~mask)
+    except OSError:
+        pass
+
+
 class ApiError(Exception):
     """The controller answered with an error, or could not be reached."""
 
@@ -154,6 +167,7 @@ class Api:
                     raise ApiError(f"the download is incomplete: {received} of {length} bytes")
                 if expected and h.hexdigest() != expected.strip().lower():
                     raise ApiError("the download was damaged in transit (checksum mismatch)")
+                ordinary_permissions(partial)
                 os.replace(partial, dest)
             except BaseException:
                 if os.path.exists(partial):
