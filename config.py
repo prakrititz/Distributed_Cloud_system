@@ -67,6 +67,13 @@ MAX_TRANSFERS = _int_setting("MAX_TRANSFERS", 32)
 # at a time (a chunk's copies are still written at the same time).
 PARALLEL_CHUNKS = _int_setting("PARALLEL_CHUNKS", 4)
 
+# Chunks recently downloaded are kept in the controller's memory, up to this
+# many megabytes, so a chunk downloaded again is not fetched from a worker
+# again (controller/chunk_cache.py). Least recently used chunks go first.
+# 0 turns the cache off. Uploads are not cached: an upload still counts only
+# once every copy is on a worker's disk.
+CHUNK_CACHE_MB = _int_setting("CHUNK_CACHE_MB", 64, minimum=0)
+
 # Connections. The controller keeps a pool of open connections to each worker
 # and reuses them (HTTP keep-alive) instead of opening a new connection for
 # every request; WORKER_CONNECTIONS is how many it keeps open per worker (a
