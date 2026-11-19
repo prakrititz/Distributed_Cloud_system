@@ -143,13 +143,25 @@ A browser works for every GET, for example http://127.0.0.1:5000/api/v1/replicat
 ### All at once
 
 ```powershell
-python demo.py              # all seven, prints what to look at
+python demo.py              # all eight, prints what to look at
 python demo.py --pause      # waits for Enter after each one: use this to present
 python demo.py failure      # only one (names: python demo.py --list)
 ```
 
 The failure demo waits for automatic repair (30 s after the worker stops). Start
 with `$env:AUTO_REPAIR_GRACE=15; docker compose up -d` for a shorter wait.
+
+The demos read every chunk from the workers (`Cache-Control: no-cache`), so
+the controller's chunk cache never hides a stopped worker or a damaged copy.
+The `cache` demo shows the cache itself: the same file downloaded twice,
+first `X-Cache: MISS`, then `HIT`, with the time of each. By hand:
+
+```powershell
+$h = "Authorization: Bearer admin-dev-key"
+curl.exe -s -D - -o NUL -H $h http://127.0.0.1:5000/api/v1/objects/<object_id> | Select-String X-Cache   # MISS, then HIT
+curl.exe -s -D - -o NUL -H $h -H "Cache-Control: no-cache" http://127.0.0.1:5000/api/v1/objects/<object_id> | Select-String X-Cache   # BYPASS
+curl.exe -H $h http://127.0.0.1:5000/api/v1/cache                    # hits, misses, memory used
+```
 
 ### By hand, step by step
 
@@ -214,6 +226,7 @@ $env:CHUNK_SIZE=524288; docker compose up -d         # 512 KB chunks
 $env:REPLICATION_FACTOR=3; docker compose up -d      # 3 copies of every chunk (needs >= 3 workers)
 $env:WORKER_CAPACITY=20000000; docker compose up -d  # 20 MB per worker
 $env:AUTO_REPAIR_GRACE=0; docker compose up -d       # automatic repair off
+$env:CHUNK_CACHE_MB=256; docker compose up -d        # a bigger chunk cache (0: off)
 Remove-Item Env:WORKERS                              # back to the default
 ```
 

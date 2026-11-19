@@ -232,6 +232,7 @@ class Cluster:
             d._save()
         # placement and auto-repair start from scratch, so every test sees the same behaviour
         d._pair_use.clear()
+        d.cache.clear()                  # no test sees chunks another one downloaded
         d._rotation = 0
         d._down_since.clear()
         d._repaired_for.clear()

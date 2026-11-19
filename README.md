@@ -308,6 +308,8 @@ GET /api/v1/objects/<object_id>/metadata
 | GET | `/health` | The controller is up (Docker's healthcheck); needs no key | |
 | GET | `/api/v1/nodes` | Workers: up/down, capacity, used, free, chunks, seconds since the last heartbeat. Admin | 403 |
 | GET | `/api/v1/replication` | Health of every chunk and copy; `auto_repair` status. Admin | 403 |
+| GET | `/api/v1/cache` | The chunk cache: `enabled`, `capacity_bytes`, `used_bytes`, `chunks`, `hits`, `misses`, `hit_rate`, `evictions`. Admin | 403 |
+| DELETE | `/api/v1/cache` | Empty the chunk cache (the counters stay); returns `dropped` and the stats. Admin | 403 |
 | POST | `/api/v1/repair` | Repair now; returns what was done. Admin | 403, 409 already running |
 | POST | `/api/v1/cleanup` | Delete orphaned copies; `?min_age=` seconds (default 60). Admin | 400, 403, 409 no saved metadata / repair running |
 | POST | `/internal/workers/register` | Sent by a worker when it starts: `worker_id`, `url`, `capacity`, `used`, `free`, `chunks`. 201 new, 200 known | 400 |
@@ -368,6 +370,7 @@ In Docker they are at the top of `docker-compose.yml` (see [GUIDE.md](GUIDE.md))
 | `QUOTA_PER_CLIENT` | 0 | controller | bytes one client may store; 0 = no limit (with authentication; admins have none) |
 | `API_KEY` | empty (Docker: the client's key) | client | the key `client.py` sends; without it, the key saved by `register` |
 | `OBJECTSTORE_CREDENTIALS` | ~/.objectstore/credentials.json | client | where `register` saves the key |
+| `CHUNK_CACHE_MB` | 64 | controller | megabytes of recently downloaded chunks kept in memory (see *Chunk cache*); 0 turns it off |
 | `PARALLEL_CHUNKS` | 4 | controller | chunks moving at once within one upload or download (memory: about this many chunks per transfer) |
 | `WORKER_CONNECTIONS` | 32 | controller | open connections kept per worker and reused |
 | `WORKER_THREADS` | 32 | worker | requests a worker answers at the same time (waitress threads) |
@@ -406,6 +409,7 @@ python -m pytest tests -m "not cluster"   # only the fast tests that start no se
 | `test_client_registration.py` | clients registering themselves: a key that works, only its hash stored, names that are taken (fixed clients, admins, registered clients, owners of objects), bad names, the registration rate, registered clients isolated from each other, the credentials file, every store keeping registrations |
 | `test_connections.py` | reused connections: one connection for many requests to a worker, many threads sharing a pool, a dead worker still noticed and a restarted one reused, a worker usable as soon as it counts as alive |
 | `test_parallel.py` | several chunks in flight: copies written at the same time, at most `PARALLEL_CHUNKS` at once, chunks finishing out of order, a failure or bad checksum with chunks in flight, downloads fetched ahead but sent in order, an abandoned download fetching nothing more |
+| `test_chunk_cache.py` | the chunk cache: least recently used out first within its limit, many threads; a second download asks no worker, a damaged copy is never cached, a delete (also during a download) empties it, `no-cache` reads the workers, a cached chunk survives its workers going down; `X-Cache`, the stats, emptying it, admins only |
 | `test_streaming.py` | streamed uploads and downloads: a bounded number of chunks at a time, raw uploads, checksum at the end, uploads and downloads cut off half-way, delete during a download, `MAX_TRANSFERS`, a 50 MB file in a few MB of memory |
 | `test_registration.py` | workers registering and re-registering, more workers joining, finding the id in Docker |
 | `test_docker_files.py` | each image's allowlist starts its program, the settings work, the compose file and Dockerfiles say what the spec requires |
@@ -431,7 +435,8 @@ Most of what is left on upload is the development server itself: after each
 request it reads the rest of the connection into a fresh 10 MB buffer.
 `tests/test_streaming.py` checks that a 50 MB file passes through the client and
 the controller together in under 10 MB (about 3 MB up and 5 MB down; it was 200
-MB up and 100 MB down before).
+MB up and 100 MB down before), plus what the chunk cache keeps, which never
+exceeds `CHUNK_CACHE_MB`.
 
 ## Speed
 
@@ -459,6 +464,44 @@ Several clients at once (20 MB each, total throughput):
 With several clients the total levels off around 200 MB/s: everything
 (clients, controller, workers, one disk) runs on one machine, and every byte
 passes through the one controller.
+
+### Chunk cache
+
+The controller keeps the chunks it has recently sent to clients in memory, up
+to `CHUNK_CACHE_MB` (64 MB). The least recently used go first. When a client
+downloads a chunk that is in memory, no worker is asked: no request, no disk
+read, no second checksum check.
+
+- **It cannot give out old data.** A chunk's id is its object's id plus its
+  position. Object ids are never reused, and a chunk's bytes never change
+  after upload (repair copies the same bytes). Deleting an object removes its
+  chunks from the cache, also when the delete happens during a download.
+- **Only checked data goes in.** A chunk is cached after its checksum
+  matched, so a damaged copy is never cached.
+- **Reads only.** Uploads are not cached: an upload still counts only once
+  both copies are on workers' disks.
+- **Repair and the replication report look at the disks**, not at the cache,
+  so a copy damaged after it was cached is still found and repaired.
+- **A cached chunk can be downloaded even while every worker holding it is
+  down.**
+- **Every download says where its chunks came from** in its `X-Cache` header:
+  `HIT` (all from memory), `PARTIAL`, `MISS` (all from workers), `BYPASS` or
+  `OFF`. A request with `Cache-Control: no-cache` reads every chunk from a
+  worker. The demonstrations use that, so they show what the workers do. Admins
+  see the hit rate and memory use in `GET /api/v1/cache` and in the dashboard's
+  top bar.
+
+A 20 MB file downloaded again, local cluster, median of 5:
+
+| | Download |
+|---|---|
+| from the workers (`Cache-Control: no-cache`) | 116 ms |
+| from the cache (`X-Cache: HIT`) | **76 ms** |
+
+That is the smallest gain to expect. Here the workers run on the same machine
+and their chunk files were already in the operating system's file cache. What
+is left is the controller sending 20 MB over HTTP. Across a real network, or
+with files not yet in memory on the workers, each cached chunk saves more.
 
 ### Reused connections
 
