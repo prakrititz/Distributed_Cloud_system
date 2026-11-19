@@ -85,6 +85,14 @@ WORKER_THREADS = _int_setting("WORKER_THREADS", 32)
 # everything, as before).
 API_KEYS = os.environ.get("API_KEYS", "").strip()
 ADMINS = os.environ.get("ADMINS", "admin").strip()
+# AUTH=1 turns authentication on even with no API_KEYS (then every client
+# registers itself). It is on anyway when API_KEYS is set.
+AUTH_REQUIRED = os.environ.get("AUTH", "").strip().lower() in ("1", "on", "true", "yes")
+# Self-registration (with authentication on): a new client calls
+# POST /api/v1/clients and the controller gives it a key of its own, once.
+# At most REGISTRATIONS_PER_MINUTE registrations per network address.
+ALLOW_REGISTRATION = os.environ.get("ALLOW_REGISTRATION", "1").strip().lower() not in ("0", "off", "false", "no")
+REGISTRATIONS_PER_MINUTE = _int_setting("REGISTRATIONS_PER_MINUTE", 10)
 
 # A fair share of capacity for every client (per authenticated client, or per
 # client_id when there is no authentication):
