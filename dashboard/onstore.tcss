@@ -1,0 +1,130 @@
+/* On Store: black background, bright high-contrast colours. */
+
+Screen {
+    background: #000000;
+    color: #e8e8e8;
+}
+
+#topbar {
+    height: 1;
+    background: #121212;
+}
+
+/* ---------------------------------------------------------------- overview */
+#overview {
+    layout: grid;
+    grid-size: 3 2;
+    grid-columns: 38 1fr 46;
+    grid-rows: 3fr 2fr;
+    height: 1fr;
+}
+
+.pane {
+    background: #000000;
+    border: round #444444;
+    border-title-color: #9e9e9e;
+    border-title-style: bold;
+    padding: 0 1;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+.pane:focus {
+    border: round #00e5ff;
+    border-title-color: #000000;
+    border-title-background: #00e5ff;
+}
+
+#events {
+    column-span: 2;
+    text-wrap: wrap;
+    scrollbar-size-vertical: 1;
+    scrollbar-color: #444444;
+    scrollbar-background: #000000;
+}
+
+/* ------------------------------------------------------------- command bar */
+#cmdbar {
+    height: 1;
+    display: none;
+    background: #121212;
+}
+
+#prompt {
+    width: auto;
+}
+
+#cmd {
+    border: none;
+    height: 1;
+    padding: 0 1;
+    background: #121212;
+    color: #ffffff;
+}
+
+#cmd:focus {
+    border: none;
+}
+
+/* -------------------------------------------------------------------- flow */
+#flow {
+    layout: grid;
+    grid-size: 2 2;
+    grid-columns: 3fr 2fr;
+    grid-rows: 3fr 2fr;
+    height: 1fr;
+}
+
+/* ------------------------------------------------------------------ footer */
+Footer {
+    background: #121212;
+}
+
+/* ----------------------------------------------------------------- windows */
+ModalScreen {
+    align: center middle;
+    background: #000000 60%;
+}
+
+#dialog {
+    width: 116;
+    max-width: 95%;
+    height: auto;
+    max-height: 90%;
+    background: #080808;
+    border: round #00e5ff;
+    border-title-color: #000000;
+    border-title-background: #00e5ff;
+    border-title-style: bold;
+    border-subtitle-color: #6c6c6c;
+    padding: 1 2;
+}
+
+#dialog.small {
+    width: 64;
+}
+
+#dialog VerticalScroll {
+    height: auto;
+    max-height: 100%;
+}
+
+/* ----------------------------------------------------- client dashboard */
+#client {
+    layout: grid;
+    grid-size: 2 3;
+    grid-columns: 3fr 2fr;
+    grid-rows: 2fr 1fr 2fr;
+    height: 1fr;
+}
+
+#details {
+    row-span: 2;
+}
+
+#output {
+    text-wrap: wrap;
+    scrollbar-size-vertical: 1;
+    scrollbar-color: #444444;
+    scrollbar-background: #000000;
+}

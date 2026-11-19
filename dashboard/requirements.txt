@@ -1,0 +1,4 @@
+# The dashboard only (the object store itself does not need these).
+#     pip install -r dashboard/requirements.txt
+textual>=0.80
+requests>=2.31
