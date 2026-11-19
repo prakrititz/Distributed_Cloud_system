@@ -231,10 +231,13 @@ class Distributor:
     # ------------------------------------------------------------------
     # persistence
     # ------------------------------------------------------------------
-    def _save(self) -> None:
-        """Save all metadata. Call with self._lock held, right after a change,
-        so saves happen in the same order as the changes."""
-        self.store.save(list(self.metadata.values()))
+    def _save(self, objects=(), removed=(), chunks=()) -> None:
+        """Save a change: the object ids added or replaced, the object ids
+        deleted, and the ChunkInfos whose list of copies changed. A database
+        store writes only those rows; the JSON store rewrites everything.
+        Call with self._lock held, right after the change, so saves happen in
+        the same order as the changes."""
+        self.store.apply(self.metadata, objects=objects, removed=removed, chunks=chunks)
 
     @property
     def persistent(self) -> bool:
@@ -569,7 +572,7 @@ class Distributor:
                 )
                 if source_path:
                     self.paths[path_key] = object_id
-                self._save()
+                self._save(objects=[object_id])
         except BaseException as e:
             # Whatever went wrong (no space, a node died, the client went
             # away, a bad checksum, a bug), never leave copies behind that no
@@ -830,7 +833,7 @@ class Distributor:
                 else:
                     meta.custom[key] = value
             meta.modified_at = _now()
-            self._save()
+            self._save(objects=[object_id])
             return meta
 
     def delete(self, object_id: str) -> list:
@@ -851,7 +854,7 @@ class Distributor:
             path_key = (meta.client_id, meta.source_path)
             if meta.source_path and self.paths.get(path_key) == object_id:
                 del self.paths[path_key]
-            self._save()
+            self._save(removed=[object_id])
             if self._reading[object_id] > 0:
                 self._deleted_while_read[object_id] = meta
                 print(f"[delete] '{meta.name}' (object_id={object_id}) removed; its copies go when "
@@ -1064,7 +1067,7 @@ class Distributor:
             still_there = self.metadata.get(meta.object_id) is meta
             if still_there:
                 info.replicas = good + added + kept_down
-                self._save()
+                self._save(chunks=[info])
         if still_there and added:
             for new in added:
                 self._note_copies([new] + [n for n in info.replicas if n != new and n not in added])
@@ -1177,7 +1180,7 @@ class Distributor:
             # a copy on a worker that is only down may come back: keep it while still short
             new += [n for n in info.replicas if states.get(n) == "down" and n not in new][:short]
             info.replicas = new
-            self._save()
+            self._save(chunks=[info])
         self._note_copies(info.replicas)
         print(f"[cleanup] chunk {chunk_id} had only {len(good)} good copy/copies: "
               f"kept the intact copy on {node.node_id} instead of deleting it")

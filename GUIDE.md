@@ -46,7 +46,7 @@ What happened behind the scenes:
 2. each worker asks Docker's DNS "what is my name?" -> object-store-worker-2 -> id worker2
 3. each worker: POST http://controller:5000/internal/workers/register   (id + address)
 4. each worker: POST .../internal/workers/heartbeat every 2 s           (alive + free space)
-5. the controller loads its saved metadata (/meta/metadata.json) if there is any
+5. the controller loads its saved metadata (/meta/metadata.db, a SQLite database) if there is any
 ```
 
 ---
@@ -237,7 +237,7 @@ python client.py
 ```
 
 Start as many workers as you like, in any order (each registers itself).
-Chunks are kept in `data\workerN\`, the metadata in `data\controller\metadata.json`.
+Chunks are kept in `data\workerN\`, the metadata in `data\controller\metadata.db` (SQLite).
 Ctrl+C in a worker's terminal is the "worker failure". `demo.py` works too,
 except for its failure and integrity parts, which use `docker`.
 
