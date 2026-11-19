@@ -121,7 +121,8 @@ CREATE TABLE IF NOT EXISTS objects (
     modified_at  TEXT NOT NULL,
     source_path  TEXT NOT NULL DEFAULT '',
     client_id    TEXT NOT NULL DEFAULT '',
-    custom       TEXT NOT NULL DEFAULT '{}'          -- JSON object of the custom key-values
+    custom       TEXT NOT NULL DEFAULT '{}',         -- JSON object of the custom key-values
+    readers      TEXT NOT NULL DEFAULT '[]'          -- JSON list of other clients that may read it
 );
 -- the duplicate rule, kept by the database too: one object per client and path
 CREATE UNIQUE INDEX IF NOT EXISTS objects_one_per_path
@@ -170,6 +171,10 @@ class SqliteStore:
             self._db.execute("PRAGMA synchronous = FULL")       # on disk before a change counts as done
             self._db.execute("PRAGMA foreign_keys = ON")
             self._db.executescript(SCHEMA)
+            # a database made before objects could be shared: add the column
+            columns = {row[1] for row in self._db.execute("PRAGMA table_info(objects)")}
+            if "readers" not in columns:
+                self._db.execute("ALTER TABLE objects ADD COLUMN readers TEXT NOT NULL DEFAULT '[]'")
             version = self._db.execute("SELECT value FROM info WHERE key = 'version'").fetchone()
         except sqlite3.DatabaseError as e:
             raise ValueError(f"Cannot open the metadata database {path}: {e}") from None
@@ -198,10 +203,10 @@ class SqliteStore:
                 {"object_id": row[0], "name": row[1], "size": row[2], "checksum": row[3],
                  "content_type": row[4], "created_at": row[5], "modified_at": row[6],
                  "source_path": row[7], "client_id": row[8], "custom": json.loads(row[9]),
-                 "chunks": chunks.get(row[0], [])}
+                 "readers": json.loads(row[10]), "chunks": chunks.get(row[0], [])}
                 for row in self._db.execute(
                     "SELECT object_id, name, size, checksum, content_type, created_at, modified_at, "
-                    "source_path, client_id, custom FROM objects ORDER BY created_at, object_id")
+                    "source_path, client_id, custom, readers FROM objects ORDER BY created_at, object_id")
             ]
 
     def chunks_on(self, worker_id: str) -> list:
@@ -260,10 +265,11 @@ class SqliteStore:
         self._db.execute("DELETE FROM objects WHERE object_id = ?", (d["object_id"],))
         self._db.execute(
             "INSERT INTO objects (object_id, name, size, checksum, content_type, created_at, modified_at, "
-            "source_path, client_id, custom) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "source_path, client_id, custom, readers) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (d["object_id"], d["name"], d["size"], d.get("checksum", ""), d.get("content_type", ""),
              d.get("created_at", ""), d.get("modified_at", ""), d.get("source_path") or "",
-             d.get("client_id") or "", json.dumps(d.get("custom") or {}, sort_keys=True)))
+             d.get("client_id") or "", json.dumps(d.get("custom") or {}, sort_keys=True),
+             json.dumps(sorted(d.get("readers") or []))))
         chunks = d.get("chunks", [])
         self._db.executemany(
             "INSERT INTO chunks (chunk_id, object_id, idx, size, checksum) VALUES (?, ?, ?, ?, ?)",

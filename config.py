@@ -76,6 +76,29 @@ PARALLEL_CHUNKS = _int_setting("PARALLEL_CHUNKS", 4)
 WORKER_CONNECTIONS = _int_setting("WORKER_CONNECTIONS", 32)
 WORKER_THREADS = _int_setting("WORKER_THREADS", 32)
 
+# Authentication. API_KEYS gives every client its secret key:
+#     API_KEYS=client1=KEY1,client2=KEY2,admin=KEY3
+# A client sends "Authorization: Bearer <its key>"; who it is comes from the
+# key. Each client sees and changes only its own objects (and reads the ones
+# shared with it); the clients named in ADMINS may do everything, including
+# repair and cleanup. Empty API_KEYS: no authentication (everyone may do
+# everything, as before).
+API_KEYS = os.environ.get("API_KEYS", "").strip()
+ADMINS = os.environ.get("ADMINS", "admin").strip()
+
+# A fair share of capacity for every client (per authenticated client, or per
+# client_id when there is no authentication):
+#   MAX_TRANSFERS_PER_CLIENT  uploads and downloads of one client at once (of
+#                             the MAX_TRANSFERS in total); more get 503
+#   RATE_PER_CLIENT           requests per second of one client, with bursts of
+#   RATE_BURST                up to this many; more get 429. 0 = no limit
+#   QUOTA_PER_CLIENT          bytes one client may store; 0 = no limit
+#                             (admins have no quota)
+MAX_TRANSFERS_PER_CLIENT = _int_setting("MAX_TRANSFERS_PER_CLIENT", 8)
+RATE_PER_CLIENT = _int_setting("RATE_PER_CLIENT", 20, minimum=0)
+RATE_BURST = _int_setting("RATE_BURST", 40)
+QUOTA_PER_CLIENT = _int_setting("QUOTA_PER_CLIENT", 0, minimum=0)
+
 # Where the controller saves its metadata, so a restart keeps every object:
 # a SQLite database file (a path ending in .json uses the older JSON file
 # instead). Empty ("") keeps it only in memory.
