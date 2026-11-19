@@ -141,6 +141,7 @@ class OnStore(App):
         # the latest answers of each poll
         self._raw_nodes, self._raw_objects, self._raw_health, self._raw_inventories = [], {}, {}, {}
         self._rf, self._auto_repair = 2, None
+        self.cache_stats = None           # GET /cache (None: not known, or a controller without a cache)
         self._loaded = {"nodes": False, "objects": False}
         self._skip_moves = False          # our own repair already animated its copies
         self.own = set()                  # objects the dashboard uploaded or deleted itself
@@ -244,6 +245,10 @@ class OnStore(App):
         self._raw_health = build_health(report)
         self._rf = report.get("replication_factor", self._rf)
         self._auto_repair = report.get("auto_repair")
+        try:
+            self.cache_stats = await asyncio.to_thread(self.api.cache)
+        except ApiError:
+            self.cache_stats = None
         live = [wid for wid in self.state.workers if self.state.state_of(wid) in (UP, LATE)]
         self._raw_inventories = await asyncio.to_thread(fetch_many, self.api.inventory, live)
         self._rebuild("health")

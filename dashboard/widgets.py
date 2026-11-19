@@ -87,6 +87,13 @@ def topbar(app, suit: str = SPADES) -> Text:
             t.append(f" (last {local_time(ar['last']['at'])[11:]})", style=DIM)
     else:
         t.append("auto-repair off", style=DIM)
+    cache = getattr(app, "cache_stats", None)
+    if cache and cache.get("enabled"):
+        t.append_text(sep)
+        rate = cache.get("hit_rate")
+        t.append("cache ", style=FG)
+        t.append("-" if rate is None else f"{rate * 100:.0f}%", style=GREEN if (rate or 0) >= .5 else FG)
+        t.append(f" hit · {human_size(cache['used_bytes'])}/{human_size(cache['capacity_bytes'])}", style=DIM)
     if app.shell_proc is not None:
         t.append_text(sep)
         t.append("! running", style=f"bold {YELLOW}")

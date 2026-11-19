@@ -91,9 +91,13 @@ class Cluster:
             HEARTBEAT_INTERVAL=str(HEARTBEAT_INTERVAL),
         )
         env.pop("ADVERTISE_URL", None)
-        self.procs[node_id] = subprocess.Popen(
-            [sys.executable, "-m", "nodes.node_server"], env=env, cwd=REPO_ROOT,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Its output goes to a log file (appended across restarts), so a
+        # worker that does not come up can say why (wait_all_alive).
+        os.makedirs(self.log_dir, exist_ok=True)
+        with open(self.log_path(node_id), "ab") as log:
+            self.procs[node_id] = subprocess.Popen(
+                [sys.executable, "-m", "nodes.node_server"], env=env, cwd=REPO_ROOT,
+                stdout=log, stderr=subprocess.STDOUT)
 
     def start_extra(self, node_id: str, controller_url: str = None) -> int:
         """Start a worker the controller has never heard of (not in WORKERS):
@@ -140,6 +144,13 @@ class Cluster:
     def node_dir(self, node_id: str) -> str:
         return os.path.join(self.base_dir, node_id)
 
+    @property
+    def log_dir(self) -> str:
+        return os.path.join(self.base_dir, "logs")
+
+    def log_path(self, node_id: str) -> str:
+        return os.path.join(self.log_dir, f"{node_id}.log")
+
     def is_running(self, node_id: str) -> bool:
         p = self.procs.get(node_id)
         return p is not None and p.poll() is None
@@ -179,7 +190,27 @@ class Cluster:
     def wait_all_alive(self, seconds: float = 20) -> None:
         for n in NODE_IDS:
             if not self.wait_alive(n, seconds):
-                raise RuntimeError(f"{n} did not come up")
+                raise RuntimeError(f"{n} did not come up\n{self.why_not_alive(n)}")
+
+    def why_not_alive(self, node_id: str) -> str:
+        """What is known about a worker that does not count as alive: is its
+        process running, what the controller last heard from it, and the end
+        of its log."""
+        p = self.procs.get(node_id)
+        process = "never started" if p is None else (
+            "running" if p.poll() is None else f"exited with code {p.returncode}")
+        try:
+            age = self.distributor.heartbeat_age(node_id)
+        except Exception as e:                  # what we want is the report, whatever happens
+            age = f"? ({e})"
+        try:
+            with open(self.log_path(node_id), "rb") as f:
+                tail = f.read()[-3000:].decode("utf-8", "replace")
+        except OSError:
+            tail = "(no log)"
+        return (f"process: {process}; port {self.node_ports.get(node_id) or self.extra.get(node_id)}; "
+                f"last heartbeat {age} s ago (timeout {self.distributor.heartbeat_timeout} s)\n"
+                f"--- end of {self.log_path(node_id)} ---\n{tail}")
 
     # --- what is on disk ---------------------------------------------------
     def chunk_files(self, node_id: str) -> list:
@@ -232,6 +263,7 @@ class Cluster:
             d._save()
         # placement and auto-repair start from scratch, so every test sees the same behaviour
         d._pair_use.clear()
+        d.cache.clear()                  # no test sees chunks another one downloaded
         d._rotation = 0
         d._down_since.clear()
         d._repaired_for.clear()

@@ -20,6 +20,7 @@ x-settings:
   worker_name:        &worker_name        ${WORKER_NAME:-worker}       # workers are called worker1, worker2, ...
   api_port:           &api_port           ${API_PORT:-5000}            # the API on this machine: http://127.0.0.1:5000
   auto_repair_grace:  &auto_repair_grace  ${AUTO_REPAIR_GRACE:-30}     # seconds a worker may be down before repair starts (0: off)
+  chunk_cache_mb:     &chunk_cache_mb     ${CHUNK_CACHE_MB:-64}        # MB of recently downloaded chunks the controller keeps in memory (0: off)
   # Authentication: one secret key per client, and who is an admin (repair,
   # cleanup, worker reports). These are DEVELOPMENT keys: for anything real,
   # set API_KEYS, CLIENT1_KEY and CLIENT2_KEY in a .env file next to this one.
@@ -68,6 +69,7 @@ services:
       CHUNK_SIZE: *chunk_size
       REPLICATION_FACTOR: *replication_factor
       AUTO_REPAIR_GRACE: *auto_repair_grace
+      CHUNK_CACHE_MB: *chunk_cache_mb
       API_KEYS: *api_keys
       ADMINS: *admins
       QUOTA_PER_CLIENT: *quota_per_client

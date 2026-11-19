@@ -370,9 +370,14 @@ class TestClientStreams:
         c.retrieve(m["object_id"], str(out))
         assert out.read_bytes() == b""
 
-    def test_a_50_mb_file_goes_through_in_a_few_mb_of_memory(self, cluster, tmp_path):
+    def test_a_50_mb_file_goes_through_in_a_few_mb_of_memory(self, cluster, tmp_path, monkeypatch):
         """Client and controller run in this process (the workers do not), so
-        this measures both: with whole files in memory it was over 100 MB."""
+        this measures both: with whole files in memory it was over 100 MB.
+        The chunk cache keeps chunks on purpose, up to its own limit, so the
+        download may use a few MB plus that limit, and no more."""
+        from controller.chunk_cache import ChunkCache
+        cache = ChunkCache(8 * MB)
+        monkeypatch.setattr(cluster.distributor, "cache", cache)
         src = tmp_path / "big.bin"
         with open(src, "wb") as f:
             for _ in range(50):
@@ -382,7 +387,9 @@ class TestClientStreams:
         out, download_peak = peak_memory(lambda: c.retrieve(m["object_id"], str(tmp_path / "back.bin")))
         assert m["size"] == 50 * MB and m["chunk_count"] == 50
         assert compute_file(out) == compute_file(str(src))
-        assert upload_peak < 10 * MB and download_peak < 10 * MB, (upload_peak / MB, download_peak / MB)
+        assert upload_peak < 10 * MB, upload_peak / MB
+        assert download_peak < 10 * MB + cache.capacity, download_peak / MB
+        assert cache.stats()["used_bytes"] <= cache.capacity and cache.stats()["chunks"] == 8   # full, and no more
 
 
 class TestTransferLimit:

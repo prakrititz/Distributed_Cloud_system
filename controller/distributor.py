@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from config import HEARTBEAT_TIMEOUT, PARALLEL_CHUNKS
+from controller.chunk_cache import ChunkCache
 from controller.metadata_store import MemoryStore
 from helpers.checksum import compute, matches, running, verify
 from helpers.errors import ChecksumMismatch, ChunkCorrupt, NodeUnavailable, QuotaExceeded
@@ -169,7 +170,7 @@ class Distributor:
     def __init__(self, nodes: list, chunk_size: int = CHUNK_SIZE,
                  replication_factor: int = REPLICATION_FACTOR,
                  heartbeat_timeout: float = HEARTBEAT_TIMEOUT, store=None,
-                 parallel_chunks: int = PARALLEL_CHUNKS):
+                 parallel_chunks: int = PARALLEL_CHUNKS, cache: ChunkCache = None):
         # The node registry: a list of RemoteNode. Workers are added while the
         # system runs (register_node), so the list is never changed in place:
         # a new list replaces it, and a request already looping over the old
@@ -186,6 +187,9 @@ class Distributor:
         # How many chunks of one upload or download are moving at once. Each
         # holds one chunk in memory, so this also bounds a transfer's memory.
         self.parallel_chunks = max(1, parallel_chunks)
+        # Chunks recently downloaded, kept in memory (controller/chunk_cache.py).
+        # Off (size 0) unless one is given.
+        self.cache = cache if cache is not None else ChunkCache(0)
         # Choosing nodes reads and updates the cached free space and the pair
         # counts: one choice at a time, so two chunks in flight never both
         # count on the same free space.
@@ -685,10 +689,15 @@ class Distributor:
             return False   # the chunk arrived damaged
 
 
-    def stream_object(self, object_id: str):
+    def stream_object(self, object_id: str, use_cache: bool = True):
         """Start a download: returns (metadata, chunks), where chunks is an
         iterator giving the object's bytes one chunk at a time, in order.
         Only one chunk is in memory at a time.
+
+        A chunk in the cache is given out from there, without asking a worker;
+        so it can be downloaded even while every worker holding it is down.
+        use_cache=False reads every chunk from a worker (what was read is
+        still cached).
 
         Every copy read from a node is checked against the checksum recorded
         at upload; a damaged copy is skipped like a missing one, and the next
@@ -712,12 +721,12 @@ class Distributor:
             chunks = sorted(meta.chunks, key=lambda c: c.index)
             print(f"[download] '{meta.name}' (object_id={object_id}): {len(chunks)} chunk(s)")
             for info in chunks:
-                self._need_live_copy(info)
-            first = self._fetch_chunk(chunks[0]) if chunks else b""
+                self._need_live_copy(info, use_cache)
+            first = self._fetch_chunk(chunks[0], use_cache) if chunks else b""
         except BaseException:
             self._done_reading(object_id)
             raise
-        return meta, ChunkStream(self._chunks_from(meta, chunks, first),
+        return meta, ChunkStream(self._chunks_from(meta, chunks, first, use_cache),
                                  lambda: self._done_reading(object_id))
 
     def _done_reading(self, object_id: str) -> None:
@@ -738,7 +747,7 @@ class Distributor:
         to them: it is still being uploaded, or still being downloaded."""
         return object_id in self._in_flight or object_id in self._reading
 
-    def _chunks_from(self, meta: ObjectMetadata, chunks: list, first: bytes):
+    def _chunks_from(self, meta: ObjectMetadata, chunks: list, first: bytes, use_cache: bool = True):
         """The iterator behind stream_object: the first chunk (already
         fetched), then each later one in order. While one chunk is being
         sent, the next ones (up to parallel_chunks) are already being fetched
@@ -755,7 +764,7 @@ class Distributor:
                 info = next(upcoming, None)
                 if info is None:
                     return
-                ahead.append(pool.submit(self._fetch_chunk, info))
+                ahead.append(pool.submit(self._fetch_chunk, info, use_cache))
 
         try:
             fetch_ahead()
@@ -777,10 +786,13 @@ class Distributor:
                 pool.shutdown(wait=False)
 
 
-    def _need_live_copy(self, info: ChunkInfo) -> None:
-        """Raise RuntimeError if no node that holds a copy of this chunk is up.
-        A node with a recent heartbeat counts as up without being asked; the
-        others are asked whether they still have it (a HEAD request, no data)."""
+    def _need_live_copy(self, info: ChunkInfo, use_cache: bool = True) -> None:
+        """Raise RuntimeError if no node that holds a copy of this chunk is up
+        (and it is not in the cache). A node with a recent heartbeat counts as
+        up without being asked; the others are asked whether they still have
+        it (a HEAD request, no data)."""
+        if use_cache and info.chunk_id in self.cache:
+            return
         for node_id in info.replicas:
             if not self.counts_as_down(node_id) and not isinstance(self._node_for(node_id), _UnregisteredNode):
                 return
@@ -801,9 +813,16 @@ class Distributor:
         with chunks:
             return b"".join(chunks)
 
-    def _fetch_chunk(self, info: ChunkInfo) -> bytes:
-        """Try each replica in order; fall back to the next if one is down,
-        has lost the chunk, or returns data that fails the checksum."""
+    def _fetch_chunk(self, info: ChunkInfo, use_cache: bool = True) -> bytes:
+        """The chunk from the cache if it is there (and use_cache); else try
+        each replica in order, falling back to the next if one is down, has
+        lost the chunk, or returns data that fails the checksum. A good copy
+        read from a node is cached."""
+        if use_cache:
+            data = self.cache.get(info.chunk_id)
+            if data is not None:
+                print(f"[download] chunk {info.index} <- cache")
+                return data
         problems = []   # (node_id, what was wrong), for the error message
         # Nodes known to be down (from heartbeats) go last, so they are not
         # waited for when another copy is available.
@@ -834,10 +853,27 @@ class Distributor:
                 continue
 
             print(f"[download] chunk {info.index} <- {node_id}")
+            self._cache_chunk(info, data)
             return data
 
         details = ", ".join(f"{n}: {why}" for n, why in problems)
         raise RuntimeError(f"No good copy of chunk {info.index} ({details})")
+
+    def _cache_chunk(self, info: ChunkInfo, data: bytes) -> None:
+        """Keep a chunk whose checksum matched, unless its object was deleted
+        meanwhile (a download still running after a delete must not bring it
+        back). Under the lock delete() takes, so it is one or the other."""
+        if not self.cache.enabled:
+            return
+        with self._lock:
+            if self._object_of(info.chunk_id) in self.metadata:
+                self.cache.put(info.chunk_id, data)
+
+    def cache_state(self, meta: ObjectMetadata) -> str:
+        """'HIT' if every chunk of the object is cached, 'MISS' if none,
+        else 'PARTIAL'. (For the X-Cache header; it may change a moment later.)"""
+        cached = sum(1 for info in meta.chunks if info.chunk_id in self.cache)
+        return "HIT" if meta.chunks and cached == len(meta.chunks) else "MISS" if not cached else "PARTIAL"
 
     # ------------------------------------------------------------------
     # metadata, delete, list
@@ -930,8 +966,10 @@ class Distributor:
         return self._delete_copies(meta)
 
     def _delete_copies(self, meta: ObjectMetadata) -> list:
-        """Remove every copy of the object's chunks from the nodes. Returns
-        the copies left behind on unreachable nodes, as (node_id, chunk_id)."""
+        """Remove every copy of the object's chunks from the nodes (and from
+        the cache). Returns the copies left behind on unreachable nodes, as
+        (node_id, chunk_id)."""
+        self.cache.discard(info.chunk_id for info in meta.chunks)
         left_behind = []
         for info in meta.chunks:
             for node_id in info.replicas:

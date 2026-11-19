@@ -16,6 +16,11 @@ Demonstrations:
     integrity    a stored chunk is damaged on purpose: detected and handled
     clients      two clients at the same time, with the same file paths; with
                  authentication, each sees only its own files unless shared
+    cache        a file downloaded twice: the second time its chunks come from
+                 the controller's memory, not from the workers
+
+The other demos read every chunk from the workers (Cache-Control: no-cache),
+so what they show is the workers' behaviour, not the cache's.
 
 The failure and integrity demos use the docker command (docker stop / docker
 exec), so they need the Docker deployment. Settings: API_URL (default
@@ -129,8 +134,11 @@ def make_file(name, size):
     return path
 
 
-def download_bytes(object_id):
-    r = requests.get(f"{API}/objects/{object_id}", timeout=60, headers=AUTH)
+def download_bytes(object_id, fresh: bool = True):
+    """The object's bytes. fresh: every chunk from a worker, not from the
+    controller's chunk cache (so a damaged or missing copy really is met)."""
+    headers = {**AUTH, "Cache-Control": "no-cache"} if fresh else AUTH
+    r = requests.get(f"{API}/objects/{object_id}", timeout=60, headers=headers)
     r.raise_for_status()
     return r.content
 
@@ -361,10 +369,47 @@ def demo_clients():
         f"quota {me['quota_bytes'] or 'none'}")
 
 
+def demo_cache():
+    title("8. Chunk cache: a second download does not ask the workers")
+    stats = get("/cache")
+    if not stats.get("enabled"):
+        say("the cache is off on this controller (CHUNK_CACHE_MB=0): nothing to show")
+        return
+    say(f"cache: {stats['capacity_bytes'] // (1024 * 1024)} MB, {stats['chunks']} chunk(s) in it now")
+    path = make_file("cache-demo.bin", 1024 * 1024 + 256 * 1024)       # 2 chunks: small, so it fits
+    data = open(path, "rb").read()
+    try:
+        meta = client.upload(path, {"demo": "cache"})
+    except ValueError as e:
+        say(f"cannot upload the demo file: {e}")
+        say("(the workers are full or down: free some space, or start the stopped workers)")
+        return
+    say(f"uploaded {meta['name']}: {meta['chunk_count']} chunks (uploads are not cached)")
+    # (Timing one small download on one machine is mostly noise; the hit
+    # counter is the proof. The README has measured times.)
+    for attempt in ("first", "second"):
+        hits = get("/cache")["hits"]
+        r = requests.get(f"{API}/objects/{meta['object_id']}", timeout=60, headers=AUTH)
+        r.raise_for_status()
+        if r.content != data:
+            fail(f"the {attempt} download differs from the original")
+        from_memory = get("/cache")["hits"] - hits
+        say(f"{attempt} download: X-Cache {r.headers.get('X-Cache')}, "
+            f"{from_memory} of {meta['chunk_count']} chunk(s) from the controller's memory, "
+            f"{meta['chunk_count'] - from_memory} from the workers")
+    if r.headers.get("X-Cache") != "HIT":
+        fail("the second download was not served from the cache")
+    after = get("/cache")
+    say(f"cache now: {after['chunks']} chunk(s), {after['used_bytes'] // 1024} KB, hit rate {after['hit_rate']}")
+    ok("the second download asked no worker, and is byte for byte the same")
+    client.delete(meta["object_id"])
+    say("deleted it again: its chunks leave the cache too")
+
+
 DEMOS = {
     "storage": demo_storage, "chunking": demo_chunking, "replication": demo_replication,
     "metadata": demo_metadata, "failure": demo_failure, "integrity": demo_integrity,
-    "clients": demo_clients,
+    "clients": demo_clients, "cache": demo_cache,
 }
 
 
