@@ -58,6 +58,8 @@ What happened behind the scenes:
 ```powershell
 $env:API_KEY = "client1-dev-key"                   # the compose file turns authentication on:
                                                    # act as client1 (keys: docker-compose.yml)
+# ...or get a key of your own instead (saved for you, used from then on):
+#   Remove-Item Env:API_KEY; python client.py register myname
 python client.py                                   # the menu
 python client.py upload files\hello.txt "owner=me,course=cloud"
 python client.py list
