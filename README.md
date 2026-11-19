@@ -35,6 +35,10 @@ python -m dashboard --key admin-dev-key      # the admin dashboard
 python -m dashboard                          # sign in or register: your client dashboard
 ```
 
+| Sign in or register | A client's dashboard |
+|---|---|
+| ![The sign-in portal](docs/portal.svg) | ![The client dashboard](docs/client-dashboard.svg) |
+
 See [dashboard/README.md](dashboard/README.md) for the screens and keys.
 
 ## Architecture
