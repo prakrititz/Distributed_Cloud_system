@@ -1,5 +1,8 @@
 # Mini Distributed Object Store
 
+[![tests](https://github.com/prakrititz/Distributed_Cloud_system/actions/workflows/tests.yml/badge.svg)](https://github.com/prakrititz/Distributed_Cloud_system/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A basic storage system where clients upload and retrieve files of any type
 (documents, images, video, audio, archives, other binary data). A controller
 splits each file into 1 MB chunks and stores every chunk on two different
@@ -516,3 +519,14 @@ store grows; SQLite writes only the rows a change touches. Its file is larger
   noticed and the next worker is used.
 - There is one controller: if it is down, nothing can be uploaded or downloaded
   (the data stays safe on the workers).
+
+## Contributing
+
+Contributions are welcome: bug reports, tests, docs and features. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for how to set up, run the tests and send a
+pull request. Every push and pull request runs the test suite and a Docker
+Compose end-to-end check in GitHub Actions.
+
+## License
+
+[MIT](LICENSE)

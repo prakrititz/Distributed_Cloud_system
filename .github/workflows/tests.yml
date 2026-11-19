@@ -1,0 +1,98 @@
+# Runs on every push and every pull request (including ones from forks).
+#
+#   tests   the whole pytest suite: unit tests, and the cluster tests that
+#           start four real worker processes and the controller
+#   docker  builds the three images, starts the system with docker compose
+#           (1 controller + 4 workers) and checks it end to end: health,
+#           every worker registered, a client container uploads and
+#           downloads, a worker stopped and the object still readable
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: pytest (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+            dashboard/requirements.txt
+      - name: Install
+        run: pip install -r requirements-dev.txt
+      - name: Fast tests (no servers started)
+        run: python -m pytest -m "not cluster" -q
+      - name: Cluster tests (real workers and controller)
+        run: python -m pytest -m cluster -q
+
+  docker:
+    name: docker compose end to end
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ADMIN: "Authorization: Bearer admin-dev-key"
+      API: http://127.0.0.1:5000
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the images
+        run: docker compose --profile clients build
+      - name: Start 1 controller + 4 workers
+        run: docker compose up -d --wait --wait-timeout 120
+      - name: The controller is healthy and every worker registered
+        run: |
+          curl -fsS "$API/health"
+          for i in $(seq 1 30); do
+            alive=$(curl -fsS -H "$ADMIN" "$API/api/v1/nodes" | python3 -c "import json,sys; print(sum(n['alive'] for n in json.load(sys.stdin)))")
+            [ "$alive" = "4" ] && break
+            sleep 1
+          done
+          echo "workers alive: $alive"
+          test "$alive" = "4"
+      - name: A client container uploads and downloads
+        run: |
+          mkdir -p downloads/client1 && chmod 777 downloads/client1
+          head -c 2621440 /dev/urandom > files/ci-big.bin
+          docker compose run --rm -T client1 upload /files/ci-big.bin "source=ci" | tee upload.txt
+          id=$(sed -n 's/^object_id: //p' upload.txt)
+          docker compose run --rm -T client1 download "$id"
+          cmp files/ci-big.bin downloads/client1/ci-big.bin
+          echo "$id" > object_id.txt
+      - name: Another client cannot see it
+        run: |
+          id=$(cat object_id.txt)
+          docker compose run --rm -T client2 info "$id" | tee info.txt || true
+          grep -q "404" info.txt
+      - name: A worker stops; the object is still downloadable
+        run: |
+          id=$(cat object_id.txt)
+          docker stop object-store-worker-2
+          curl -fsS -H "Authorization: Bearer client1-dev-key" "$API/api/v1/objects/$id" -o again.bin
+          cmp files/ci-big.bin again.bin
+          docker start object-store-worker-2
+      - name: Logs
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Stop
+        if: always()
+        run: docker compose down -v
