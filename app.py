@@ -22,12 +22,13 @@ from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, Response, g, request, jsonify
 from werkzeug.exceptions import HTTPException
 
-from config import (ADMINS, ALLOW_REGISTRATION, API_KEYS, AUTH_REQUIRED, AUTO_REPAIR_GRACE, CHUNK_SIZE,
+from config import (ADMINS, ALLOW_REGISTRATION, API_KEYS, AUTH_REQUIRED, AUTO_REPAIR_GRACE, CHUNK_CACHE_MB, CHUNK_SIZE,
                     HEARTBEAT_INTERVAL, MAX_TRANSFERS, MAX_TRANSFERS_PER_CLIENT, METADATA_PATH, NODE_ADDRESSES,
                     ORPHAN_MIN_AGE, QUOTA_PER_CLIENT, RATE_BURST, RATE_PER_CLIENT, REGISTRATIONS_PER_MINUTE,
                     REPLICATION_FACTOR)
 from controller.access import CLIENT_ID_PATTERN, ClientRegistry, ClientSlots, KeyRing, RateLimiter
 from controller.activity import ActivityLog
+from controller.chunk_cache import ChunkCache
 from controller.distributor import DEFAULT_CONTENT_TYPE, Distributor
 from controller.metadata_store import store_from_setting
 from controller.remote_node import RemoteNode
@@ -45,7 +46,8 @@ MAX_CLIENT_ID_LENGTH = 128
 # so restarting the controller keeps every object.
 distributor = Distributor([RemoteNode(node_id, url) for node_id, url in NODE_ADDRESSES.items()],
                           chunk_size=CHUNK_SIZE, replication_factor=REPLICATION_FACTOR,
-                          store=store_from_setting(METADATA_PATH))
+                          store=store_from_setting(METADATA_PATH),
+                          cache=ChunkCache(CHUNK_CACHE_MB * 1024 * 1024))   # recently downloaded chunks
 auto_repair = {"enabled": False, "grace_seconds": AUTO_REPAIR_GRACE}   # switched on in __main__
 
 
@@ -442,7 +444,11 @@ def download_object(object_id):
     """Send the object's bytes, one chunk at a time as each is read from a
     worker, so the controller never holds the whole object in memory.
     Headers: its Content-Type, Content-Length, and X-Checksum, the checksum
-    recorded at upload, so the client can verify what it received.
+    recorded at upload, so the client can verify what it received. X-Cache
+    says where the chunks came from: HIT (all from the controller's chunk
+    cache), PARTIAL, MISS (all from the workers) or BYPASS. A request with
+    'Cache-Control: no-cache' (or 'Pragma: no-cache') reads every chunk from
+    a worker.
 
     404 if there is no such object (or the caller may not read it). 503 if
     some chunk has no copy on a live worker or the first chunk has no good
@@ -460,8 +466,10 @@ def download_object(object_id):
     if refused:
         return refused
     slot_client = g.client
+    use_cache = not wants_no_cache()
     try:
-        meta, chunks = distributor.stream_object(object_id)
+        cache_state = distributor.cache_state(distributor.get_object(object_id)) if use_cache else "BYPASS"
+        meta, chunks = distributor.stream_object(object_id, use_cache=use_cache)
     except KeyError:
         give_back_transfer_slots(slot_client)
         return error(f"No object with id '{object_id}'", 404)
@@ -506,9 +514,18 @@ def download_object(object_id):
     if None not in sizes:                # unknown only for objects stored before sizes were kept
         response.headers["Content-Length"] = str(sum(sizes))
     response.headers["X-Checksum"] = meta.checksum
+    response.headers["X-Cache"] = cache_state if distributor.cache.enabled else "OFF"
     response.call_on_close(finish)       # finished, or never started (e.g. a HEAD request)
     return response
 
+
+
+def wants_no_cache() -> bool:
+    """The request asks for fresh data: Cache-Control: no-cache (or no-store,
+    max-age=0), or the older Pragma: no-cache."""
+    control = request.headers.get("Cache-Control", "").lower().replace(" ", "")
+    return (any(d in control.split(",") for d in ("no-cache", "no-store", "max-age=0"))
+            or "no-cache" in request.headers.get("Pragma", "").lower())
 
 
 @app.route("/api/v1/objects/<object_id>/metadata", methods=["GET"])
@@ -710,6 +727,24 @@ def show_replication():
     report = distributor.replication_report()
     report["auto_repair"] = {**auto_repair, "last": distributor.last_auto_repair}
     return jsonify(report)
+
+
+@app.route("/api/v1/cache", methods=["GET"])
+@admin_only
+def show_cache():
+    """The chunk cache: enabled, capacity_bytes, used_bytes, chunks, hits,
+    misses, hit_rate, evictions. Admin."""
+    return jsonify(distributor.cache.stats())
+
+
+@app.route("/api/v1/cache", methods=["DELETE"])
+@admin_only
+def clear_cache():
+    """Empty the chunk cache (the counters stay): the next downloads read
+    from the workers again. Returns how many chunks were dropped and the
+    stats. Admin."""
+    dropped = distributor.cache.clear()
+    return jsonify({"dropped": dropped, **distributor.cache.stats()})
 
 
 SPACE_FIELDS = ("capacity", "used", "free", "chunks")

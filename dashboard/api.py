@@ -110,6 +110,10 @@ class Api:
         # checks every copy of every chunk, so it may take a moment
         return self._json("GET", "/api/v1/replication", timeout=30)
 
+    def cache(self) -> dict:
+        """The controller's chunk cache: enabled, capacity_bytes, used_bytes, hits, misses, hit_rate ..."""
+        return self._json("GET", "/api/v1/cache")
+
     def inventory(self, worker_id: str) -> dict:
         return self._json("GET", f"/internal/workers/{worker_id}/chunks")
 
