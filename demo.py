@@ -14,11 +14,14 @@ Demonstrations:
     metadata     custom metadata is stored, read and changed without re-uploading
     failure      a worker container is stopped: before, during and after, repair, restart
     integrity    a stored chunk is damaged on purpose: detected and handled
-    clients      two clients at the same time, with the same file paths
+    clients      two clients at the same time, with the same file paths; with
+                 authentication, each sees only its own files unless shared
 
 The failure and integrity demos use the docker command (docker stop / docker
 exec), so they need the Docker deployment. Settings: API_URL (default
-http://127.0.0.1:5000/api/v1) and COMPOSE_PROJECT (default object-store).
+http://127.0.0.1:5000/api/v1), COMPOSE_PROJECT (default object-store), and the
+keys of the compose file's clients: ADMIN_KEY, CLIENT1_KEY, CLIENT2_KEY (default:
+its development keys). The demo acts as the admin.
 """
 import argparse
 import os
@@ -40,6 +43,13 @@ PROJECT = os.environ.get("COMPOSE_PROJECT", "object-store")
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORK = tempfile.mkdtemp(prefix="object-store-demo-")
 
+# The keys of docker-compose.yml (its development defaults unless set). A
+# server without authentication simply ignores them.
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin-dev-key")
+CLIENT_KEYS = {"client1": os.environ.get("CLIENT1_KEY", "client1-dev-key"),
+               "client2": os.environ.get("CLIENT2_KEY", "client2-dev-key")}
+AUTH = {"Authorization": f"Bearer {ADMIN_KEY}"}
+
 
 # ------------------------------------------------------------------ helpers
 def title(text):
@@ -60,7 +70,7 @@ def fail(text):
 
 
 def get(path):
-    r = requests.get(API + path, timeout=30)
+    r = requests.get(API + path, timeout=30, headers=AUTH)
     r.raise_for_status()
     return r.json()
 
@@ -120,7 +130,7 @@ def make_file(name, size):
 
 
 def download_bytes(object_id):
-    r = requests.get(f"{API}/objects/{object_id}", timeout=60)
+    r = requests.get(f"{API}/objects/{object_id}", timeout=60, headers=AUTH)
     r.raise_for_status()
     return r.content
 
@@ -130,7 +140,7 @@ def show_chunks(meta):
         say(f"  chunk {c['index']}  ->  {' + '.join(c['replicas'])}")
 
 
-client = Client(base_url=API, client_id="demo")
+client = Client(base_url=API, client_id="demo", api_key=ADMIN_KEY)
 
 
 # ----------------------------------------------------------- demonstrations
@@ -140,7 +150,7 @@ def demo_storage():
     if not os.path.exists(path):
         path = make_file("hello.txt", 100)
     original = open(path, "rb").read()
-    meta = Client(base_url=API, client_id=f"demo-{time.time_ns()}").upload(path)
+    meta = Client(base_url=API, client_id=f"demo-{time.time_ns()}", api_key=ADMIN_KEY).upload(path)
     say(f"uploaded {meta['name']} ({meta['size']} bytes) -> object_id {meta['object_id']}")
     back = download_bytes(meta["object_id"])
     say(f"checksum before: {compute(original)[:16]}...  after: {compute(back)[:16]}...")
@@ -230,7 +240,7 @@ def demo_failure():
         say(f"auto-repair: {get('/replication')['auto_repair']['last']}")
     else:
         say("$ curl -X POST .../repair")
-        r = requests.post(API + "/repair", timeout=120).json()
+        r = requests.post(API + "/repair", timeout=120, headers=AUTH).json()
         say(f"repair: {r['repaired']} chunk(s) repaired, {r['copies_created']} new copies")
     show_summary()
     ok("the replication factor is restored on the remaining workers")
@@ -241,11 +251,11 @@ def demo_failure():
     wait_for(lambda: nodes()[victim]["alive"], 60, f"{victim} back")
     say("AFTER:")
     show_nodes()
-    inv = requests.get(f"{ROOT}/internal/workers/{victim}/chunks", timeout=30).json()
+    inv = requests.get(f"{ROOT}/internal/workers/{victim}/chunks", timeout=30, headers=AUTH).json()
     say(f"{victim} came back with {inv['held']} chunk file(s); {len(inv['orphans'])} are old copies "
         f"no object points to any more (replaced while it was down)")
     if inv["orphans"]:
-        r = requests.post(API + "/cleanup?min_age=0", timeout=60).json()
+        r = requests.post(API + "/cleanup?min_age=0", timeout=60, headers=AUTH).json()
         say(f"$ curl -X POST .../cleanup  -> deleted {len(r['deleted'])} orphaned copy/copies")
     show_summary()
     ok("worker back, data intact, every chunk healthy")
@@ -272,7 +282,7 @@ def demo_integrity():
     if download_bytes(meta["object_id"]) != STATE["big_data"]:
         fail("download returned damaged data")
     ok("download is still correct: the damaged copy is skipped, the good copy is used")
-    r = requests.post(API + "/repair", timeout=120).json()
+    r = requests.post(API + "/repair", timeout=120, headers=AUTH).json()
     say(f"repair: {r['repaired']} chunk(s) repaired, {r['copies_created']} new copies (the bad copy is replaced)")
     show_summary()
     ok("the damaged copy was rebuilt from the good one")
@@ -281,8 +291,13 @@ def demo_integrity():
 def demo_clients():
     title("7. Several clients at the same time")
     path = make_file("shared-name.txt", 1500)
-    alice = Client(base_url=API, client_id=f"client1-{time.time_ns()}")
-    bob = Client(base_url=API, client_id=f"client2-{time.time_ns()}")
+    authenticated = get("/me")["authenticated"]
+    if authenticated:          # the compose file's two clients, each with its own key
+        alice = Client(base_url=API, api_key=CLIENT_KEYS["client1"])
+        bob = Client(base_url=API, api_key=CLIENT_KEYS["client2"])
+    else:
+        alice = Client(base_url=API, client_id=f"client1-{time.time_ns()}", api_key="")
+        bob = Client(base_url=API, client_id=f"client2-{time.time_ns()}", api_key="")
     results, errors = {}, []
 
     def up(name, c):
@@ -307,8 +322,43 @@ def demo_clients():
         fail("the same client uploading the same path twice was accepted")
     except ValueError as e:
         ok(f"the same client uploading the same path again is refused: {str(e)[:70]}...")
-    other = alice.list_objects()
-    say(f"each client can see and download every object ({len(other)} stored in total)")
+    if not authenticated:
+        other = alice.list_objects()
+        say(f"no authentication: each client can see and download every object ({len(other)} stored in total)")
+        return
+
+    mine, theirs = results["client1"]["object_id"], results["client2"]["object_id"]
+    try:
+        bob.get_metadata(mine)
+        fail("client2 could read client1's object")
+    except ValueError:
+        ok("client2 cannot see client1's object (404, as if it did not exist)")
+    try:
+        bob.delete(mine)
+        fail("client2 could delete client1's object")
+    except ValueError:
+        ok("client2 cannot delete it either")
+    listed = {o["object_id"] for o in bob.list_objects()}
+    if mine in listed or theirs not in listed:
+        fail("client2's listing is wrong")
+    ok(f"client2's listing shows only its own objects ({len(listed)})")
+    alice.share(mine, ["client2"])
+    copy = bob.retrieve(mine, os.path.join(WORK, "shared-copy.txt"))
+    ok(f"client1 shares it with client2: client2 downloads it ({os.path.getsize(copy)} bytes)")
+    try:
+        bob.delete(mine)
+        fail("a reader could delete the owner's object")
+    except ValueError as e:
+        ok(f"but a reader cannot delete it: {str(e)[:60]}...")
+    alice.share(mine, [])
+    try:
+        bob.get_metadata(mine)
+        fail("still readable after sharing was stopped")
+    except ValueError:
+        ok("client1 stops sharing: client2 cannot see it any more")
+    me = alice.me()
+    say(f"client1's limits: {me['transfers_allowed']} transfers at once, {me['requests_per_second']} requests/s, "
+        f"quota {me['quota_bytes'] or 'none'}")
 
 
 DEMOS = {

@@ -14,6 +14,11 @@ class ChunkCorrupt(Exception):
     or damaged while stored on a node."""
 
 
+class QuotaExceeded(Exception):
+    """Raised when an upload would take a client over its storage quota.
+    Nothing of the upload is kept."""
+
+
 class ChecksumMismatch(Exception):
     """Raised when an upload's bytes do not match the checksum the client sent
     with them: damaged in transit. Nothing of the upload is kept."""

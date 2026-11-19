@@ -39,9 +39,18 @@ def default_client_id() -> str:
 
 
 class Client:
-    def __init__(self, base_url: str = BASE_URL, client_id: str = None):
+    def __init__(self, base_url: str = BASE_URL, client_id: str = None, api_key: str = None):
         self.base_url = base_url
         self.client_id = client_id or default_client_id()
+        # With authentication, every request carries this client's secret key
+        # (API_KEY), and the server knows from it who we are.
+        self.api_key = api_key if api_key is not None else os.environ.get("API_KEY", "").strip()
+
+    def _headers(self, extra: dict = None) -> dict:
+        headers = dict(extra or {})
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
 
     @staticmethod
     def _check(response) -> None:
@@ -68,8 +77,9 @@ class Client:
             "name": name,
             "checksum": compute_file(path),          # fingerprint of exactly these bytes
             "path": os.path.abspath(path),
-            "client_id": self.client_id,             # the duplicate rule is per client + path
         }
+        if not self.api_key:
+            params["client_id"] = self.client_id     # with a key, the server knows who we are
         if metadata:
             params["metadata"] = json.dumps(metadata)
 
@@ -77,7 +87,7 @@ class Client:
         # open file makes requests send it a block at a time.
         with open(path, "rb") as f:
             response = requests.post(f"{self.base_url}/objects", params=params, data=f,
-                                     headers={"Content-Type": content_type})
+                                     headers=self._headers({"Content-Type": content_type}))
         self._check(response)
         return response.json()
 
@@ -99,7 +109,8 @@ class Client:
                 raise ValueError(f"'{name}' already exists here; choose another name to save as")
             save_to = name
 
-        with requests.get(f"{self.base_url}/objects/{object_id}", stream=True) as response:
+        with requests.get(f"{self.base_url}/objects/{object_id}", stream=True,
+                          headers=self._headers()) as response:
             self._check(response)
             expected = response.headers.get("X-Checksum")
             length = response.headers.get("Content-Length")
@@ -129,20 +140,21 @@ class Client:
 
     def get_metadata(self, object_id: str) -> dict:
         """The object's metadata, without downloading it."""
-        response = requests.get(f"{self.base_url}/objects/{object_id}/metadata")
+        response = requests.get(f"{self.base_url}/objects/{object_id}/metadata", headers=self._headers())
         self._check(response)
         return response.json()
 
     def update_metadata(self, object_id: str, updates: dict) -> dict:
         """Add or change custom metadata (a None value removes that key).
         The stored data is not touched. Returns the updated metadata."""
-        response = requests.patch(f"{self.base_url}/objects/{object_id}/metadata", json=updates)
+        response = requests.patch(f"{self.base_url}/objects/{object_id}/metadata", json=updates,
+                                  headers=self._headers())
         self._check(response)
         return response.json()
 
     def delete(self, object_id: str) -> None:
         """Delete the object and every copy of it."""
-        response = requests.delete(f"{self.base_url}/objects/{object_id}")
+        response = requests.delete(f"{self.base_url}/objects/{object_id}", headers=self._headers())
         self._check(response)
 
     def list_objects(self, limit: int = None, offset: int = 0) -> list:
@@ -150,7 +162,21 @@ class Client:
         params = {"offset": offset}
         if limit is not None:
             params["limit"] = limit
-        response = requests.get(f"{self.base_url}/objects", params=params)
+        response = requests.get(f"{self.base_url}/objects", params=params, headers=self._headers())
+        self._check(response)
+        return response.json()
+
+    def share(self, object_id: str, readers: list) -> dict:
+        """Set which other clients may read one of our objects ([] stops
+        sharing). Returns {object_id, owner, readers}."""
+        response = requests.put(f"{self.base_url}/objects/{object_id}/readers", json={"readers": readers},
+                                headers=self._headers())
+        self._check(response)
+        return response.json()
+
+    def me(self) -> dict:
+        """Who the server says we are, what we store, and our limits."""
+        response = requests.get(f"{self.base_url}/me", headers=self._headers())
         self._check(response)
         return response.json()
 
@@ -183,8 +209,11 @@ python client.py list                          list the stored objects
 python client.py info OBJECT_ID                show an object's metadata
 python client.py update OBJECT_ID k=v,k2=null  change custom metadata (null removes a key)
 python client.py delete OBJECT_ID              delete an object
+python client.py share OBJECT_ID client2,client3   let other clients read it (share OBJECT_ID - : nobody)
+python client.py me                            who the server says you are, your storage and limits
 
-Settings: API_URL (default http://127.0.0.1:5000/api/v1) and CLIENT_ID."""
+Settings: API_URL (default http://127.0.0.1:5000/api/v1), CLIENT_ID, and API_KEY
+(this client's secret key, when the server requires one)."""
 
 
 def run_command(client: "Client", args: list) -> int:
@@ -192,14 +221,14 @@ def run_command(client: "Client", args: list) -> int:
     scripts). Prints the result; returns the exit code (0 ok, 1 error, 2 bad usage)."""
     command, rest = args[0], args[1:]
     arity = {"upload": (1, 2), "download": (1, 2), "list": (0, 0), "info": (1, 1),
-             "update": (2, 2), "delete": (1, 1)}
+             "update": (2, 2), "delete": (1, 1), "share": (2, 2), "me": (0, 0)}
     if command not in arity or not arity[command][0] <= len(rest) <= arity[command][1]:
         print(USAGE)
         return 2
     try:
         if command == "upload":
             info = client.upload(rest[0], parse_pairs(rest[1]) if len(rest) > 1 else None)
-            print(f"Uploaded '{info['name']}' as client '{client.client_id}': {info['size']} bytes in "
+            print(f"Uploaded '{info['name']}' as client '{info['client_id']}': {info['size']} bytes in "
                   f"{info['chunk_count']} chunk(s)")
             for c in info["chunks"]:
                 print(f"  chunk {c['index']}: {', '.join(c['replicas'])}")
@@ -219,6 +248,12 @@ def run_command(client: "Client", args: list) -> int:
         elif command == "delete":
             client.delete(rest[0])
             print("Deleted.")
+        elif command == "share":
+            readers = [] if rest[1].strip() == "-" else [r.strip() for r in rest[1].split(",") if r.strip()]
+            shared = client.share(rest[0], readers)
+            print(f"Readers of {shared['object_id']}: {', '.join(shared['readers']) or 'nobody'}")
+        elif command == "me":
+            print(json.dumps(client.me(), indent=2))
         return 0
     except (OSError, ValueError, requests.RequestException) as e:
         print(f"Error: {e}")

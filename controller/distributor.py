@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from config import HEARTBEAT_TIMEOUT, PARALLEL_CHUNKS
 from controller.metadata_store import MemoryStore
 from helpers.checksum import compute, matches, running, verify
-from helpers.errors import ChecksumMismatch, ChunkCorrupt, NodeUnavailable
+from helpers.errors import ChecksumMismatch, ChunkCorrupt, NodeUnavailable, QuotaExceeded
 
 CHUNK_SIZE = 1024 * 1024    # 1 MB, as the project spec says
 REPLICATION_FACTOR = 2      # copies of every chunk, each on a different node
@@ -95,7 +95,15 @@ class ObjectMetadata:
     modified_at: str = ""                       # changes when custom metadata is patched
     custom: dict = field(default_factory=dict)  # user-defined key-value metadata
     source_path: str = ""                       # where the client read the file
-    client_id: str = ""                         # which client sent it; (client_id, source_path) is unique
+    client_id: str = ""                         # which client sent it (its owner); (client_id, source_path) is unique
+    readers: list = field(default_factory=list)  # other clients allowed to read it
+
+    @property
+    def stored_bytes(self) -> int:
+        """Bytes this object takes on the workers (one copy): the sum of its
+        chunks, or its size for objects saved before chunk sizes were kept."""
+        sizes = [c.size for c in self.chunks]
+        return sum(sizes) if sizes and None not in sizes else self.size
 
     @staticmethod
     def from_dict(d: dict) -> "ObjectMetadata":
@@ -221,6 +229,13 @@ class Distributor:
         # never loses its data half-way.
         self._reading = Counter()
         self._deleted_while_read = {}
+
+        # Storage per client, for quotas: bytes of the objects it owns
+        # (_used), and bytes of its uploads still arriving (_pending).
+        self._used = Counter()
+        self._pending = Counter()
+        for meta in self.metadata.values():
+            self._used[meta.client_id] += meta.stored_bytes
 
         # Automatic repair (auto_repair_check): when each worker was first
         # seen down, and the workers already repaired for.
@@ -444,7 +459,7 @@ class Distributor:
     # ------------------------------------------------------------------
     def upload(self, name: str, data, content_type: str = DEFAULT_CONTENT_TYPE,
                custom: dict = None, source_path: str = None, size: int = None,
-               client_id: str = None, checksum: str = None) -> str:
+               client_id: str = None, checksum: str = None, quota: int = None) -> str:
         """Store the data as chunks, each on REPLICATION_FACTOR different
         nodes, record metadata. Return the new object_id.
 
@@ -471,6 +486,11 @@ class Distributor:
                      checksum of what arrived is built up chunk by chunk, in
                      reading order, and compared at the end; on a mismatch
                      everything stored is deleted and ChecksumMismatch is raised.
+        quota        bytes this client may store in total (optional). The
+                     upload is counted against it while it arrives, together
+                     with the client's stored objects and its other uploads
+                     still arriving; as soon as it would go over, everything
+                     stored for it is deleted and QuotaExceeded is raised.
 
         The object_id is generated here, used to name the chunks, and only
         becomes visible (metadata and path index) once ALL copies of ALL
@@ -483,7 +503,8 @@ class Distributor:
 
         Raises FileExistsError if this client already has an object from this
         source_path, RuntimeError if there is not enough room on enough live
-        nodes, ChecksumMismatch for a damaged upload.
+        nodes, ChecksumMismatch for a damaged upload, QuotaExceeded when the
+        client's quota would be exceeded.
         """
         client_id = client_id or ""
         path_key = (client_id, source_path)
@@ -494,6 +515,7 @@ class Distributor:
         object_id = str(uuid.uuid4())
         whole = running()   # checksum of the whole object, built up chunk by chunk
         received = 0        # bytes read so far
+        counted = 0         # of those, bytes counted against the client's quota while arriving
         print(f"[upload] '{name}': storing, {self.replication_factor} copies of every chunk, "
               f"up to {self.parallel_chunks} chunks at once")
 
@@ -527,6 +549,9 @@ class Distributor:
                 for index, chunk in enumerate(self._read_chunks(data)):
                     whole.update(chunk)
                     received += len(chunk)
+                    if quota is not None:
+                        counted += len(chunk)    # first: the check below counts it even when it refuses
+                        self._count_against_quota(client_id, len(chunk), quota)
                     self._rotation += 1        # equal nodes take turns, chunk by chunk
                     # Choosing the nodes is done here, in order, so placement
                     # is the same as if the chunks went one after another.
@@ -572,6 +597,7 @@ class Distributor:
                 )
                 if source_path:
                     self.paths[path_key] = object_id
+                self._used[client_id] += received
                 self._save(objects=[object_id])
         except BaseException as e:
             # Whatever went wrong (no space, a node died, the client went
@@ -585,10 +611,16 @@ class Distributor:
                     meta = self.metadata.pop(object_id)
                     if meta.source_path and self.paths.get(path_key) == object_id:
                         del self.paths[path_key]
+                    self._used[client_id] -= received
             self._rollback(written)
             raise
         finally:
             self._in_flight.discard(object_id)
+            if counted:
+                with self._lock:
+                    self._pending[client_id] -= counted
+                    if self._pending[client_id] <= 0:
+                        del self._pending[client_id]
 
         print(f"[upload] done, '{name}': {received} bytes in {len(placed)} chunk(s) -> object_id={object_id}")
         return object_id
@@ -821,6 +853,36 @@ class Distributor:
         """All objects' metadata, oldest first."""
         return sorted(list(self.metadata.values()), key=lambda m: (m.created_at, m.object_id))
 
+    # ------------------------------------------------------------------
+    # per-client storage (quotas) and sharing
+    # ------------------------------------------------------------------
+    def used_bytes(self, client_id: str) -> int:
+        """Bytes stored by this client, plus its uploads still arriving."""
+        with self._lock:
+            return self._used[client_id or ""] + self._pending[client_id or ""]
+
+    def _count_against_quota(self, client_id: str, nbytes: int, quota: int) -> None:
+        """Count nbytes of an arriving upload for this client; raise
+        QuotaExceeded if its stored bytes plus everything still arriving would
+        go over the quota."""
+        with self._lock:
+            self._pending[client_id] += nbytes
+            total = self._used[client_id] + self._pending[client_id]
+        if total > quota:
+            raise QuotaExceeded(f"Storage quota exceeded: client '{client_id}' may store {quota} bytes, "
+                                f"this upload would take it to at least {total}")
+
+    def set_readers(self, object_id: str, readers: list) -> ObjectMetadata:
+        """Set which other clients may read an object (download it and read
+        its metadata). The owner is never listed. Raises KeyError if there is
+        no such object."""
+        with self._lock:
+            meta = self.get_object(object_id)
+            meta.readers = sorted({r for r in readers if r and r != meta.client_id})
+            meta.modified_at = _now()
+            self._save(objects=[object_id])
+            return meta
+
     def update_custom_metadata(self, object_id: str, updates: dict) -> ObjectMetadata:
         """Add or change custom key-value metadata, without touching the stored
         data. A value of None removes that key. Updates modified_at. Raises
@@ -854,6 +916,7 @@ class Distributor:
             path_key = (meta.client_id, meta.source_path)
             if meta.source_path and self.paths.get(path_key) == object_id:
                 del self.paths[path_key]
+            self._used[meta.client_id] -= meta.stored_bytes   # frees the owner's quota
             self._save(removed=[object_id])
             if self._reading[object_id] > 0:
                 self._deleted_while_read[object_id] = meta

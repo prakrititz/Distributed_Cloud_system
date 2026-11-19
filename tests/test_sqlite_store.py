@@ -17,11 +17,11 @@ from controller.metadata_store import JsonFileStore, MemoryStore, SqliteStore, s
 from tests.fakes import FakeNode
 
 
-def obj(object_id, chunks=2, path="", client="", custom=None, created="2026-11-19T10:00:00Z"):
+def obj(object_id, chunks=2, path="", client="", custom=None, created="2026-11-19T10:00:00Z", readers=None):
     """A plain-dict object like the distributor saves."""
     return {"object_id": object_id, "name": f"{object_id}.bin", "size": 150, "checksum": "c" * 64,
             "content_type": "application/octet-stream", "created_at": created, "modified_at": created,
-            "source_path": path, "client_id": client, "custom": custom or {},
+            "source_path": path, "client_id": client, "custom": custom or {}, "readers": readers or [],
             "chunks": [{"chunk_id": f"{object_id}-{i}", "index": i, "replicas": ["w1", "w2"],
                         "checksum": f"k{i}", "size": 100 if i == 0 else 50} for i in range(chunks)]}
 
@@ -38,7 +38,8 @@ class TestBasics:
         assert db.load() == [] and db.persistent is True
 
     def test_round_trip_of_every_field(self, db):
-        a = obj("a", custom={"project": "demo", "n": 3, "ok": True}, path="/f/a", client="alice")
+        a = obj("a", custom={"project": "demo", "n": 3, "ok": True}, path="/f/a", client="alice",
+                readers=["bob", "carol"])
         a["chunks"][1]["size"] = None                      # saved before chunk sizes were kept
         db.save([a])
         assert db.load() == [a]

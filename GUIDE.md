@@ -35,7 +35,7 @@ Check that it is up:
 
 ```powershell
 docker compose ps                                  # all "healthy" after a few seconds
-curl.exe http://127.0.0.1:5000/api/v1/nodes        # worker1..worker4, "alive": true
+curl.exe -H "Authorization: Bearer admin-dev-key" http://127.0.0.1:5000/api/v1/nodes   # worker1..worker4, "alive": true
 docker compose logs controller                     # "worker workerN registered at ..."
 ```
 
@@ -56,6 +56,8 @@ What happened behind the scenes:
 ### a) The client on this machine
 
 ```powershell
+$env:API_KEY = "client1-dev-key"                   # the compose file turns authentication on:
+                                                   # act as client1 (keys: docker-compose.yml)
 python client.py                                   # the menu
 python client.py upload files\hello.txt "owner=me,course=cloud"
 python client.py list
@@ -95,12 +97,13 @@ Get-Job | Receive-Job -Wait
 ### c) Plain HTTP (curl)
 
 ```powershell
-curl.exe -F "file=@files/hello.txt" -F 'metadata={"owner":"me"}' http://127.0.0.1:5000/api/v1/objects
-curl.exe http://127.0.0.1:5000/api/v1/objects
-curl.exe http://127.0.0.1:5000/api/v1/objects/<object_id> -o copy.txt        # the original bytes
-curl.exe http://127.0.0.1:5000/api/v1/objects/<object_id>/metadata
-curl.exe -X PATCH -H "Content-Type: application/json" -d '{"status":"final"}' http://127.0.0.1:5000/api/v1/objects/<object_id>/metadata
-curl.exe -X DELETE http://127.0.0.1:5000/api/v1/objects/<object_id>
+$h = "Authorization: Bearer client1-dev-key"     # act as client1 (keys: docker-compose.yml)
+curl.exe -H $h -F "file=@files/hello.txt" -F 'metadata={"owner":"me"}' http://127.0.0.1:5000/api/v1/objects
+curl.exe -H $h http://127.0.0.1:5000/api/v1/objects
+curl.exe -H $h http://127.0.0.1:5000/api/v1/objects/<object_id> -o copy.txt        # the original bytes
+curl.exe -H $h http://127.0.0.1:5000/api/v1/objects/<object_id>/metadata
+curl.exe -H $h -X PATCH -H "Content-Type: application/json" -d '{"status":"final"}' http://127.0.0.1:5000/api/v1/objects/<object_id>/metadata
+curl.exe -H $h -X DELETE http://127.0.0.1:5000/api/v1/objects/<object_id>
 ```
 
 JSON on the command line: Windows PowerShell 5 drops the inner `"` when it
@@ -142,19 +145,20 @@ again. `checksum` and the data stay the same, `modified_at` changes.
 **Worker failure:**
 
 ```powershell
-curl.exe http://127.0.0.1:5000/api/v1/replication    # BEFORE: everything healthy
+$a = "Authorization: Bearer admin-dev-key"       # these are admin endpoints
+curl.exe -H $a http://127.0.0.1:5000/api/v1/replication    # BEFORE: everything healthy
 docker stop object-store-worker-2
-curl.exe http://127.0.0.1:5000/api/v1/nodes          # after ~6 s: worker2 "alive": false
-curl.exe http://127.0.0.1:5000/api/v1/replication    # DURING: chunks on worker2 are under_replicated
+curl.exe -H $a http://127.0.0.1:5000/api/v1/nodes          # after ~6 s: worker2 "alive": false
+curl.exe -H $a http://127.0.0.1:5000/api/v1/replication    # DURING: chunks on worker2 are under_replicated
 python client.py download <object_id> during.bin     # still works (the other copy is used)
 # wait 30 s: automatic repair copies those chunks to the other workers
-curl.exe http://127.0.0.1:5000/api/v1/replication    # healthy again; "auto_repair.last" says what it did
+curl.exe -H $a http://127.0.0.1:5000/api/v1/replication    # healthy again; "auto_repair.last" says what it did
 docker start object-store-worker-2                   # it registers again; its old chunks are still on its volume
-curl.exe http://127.0.0.1:5000/internal/workers/worker2/chunks   # those old copies are now "orphans"
-curl.exe -X POST "http://127.0.0.1:5000/api/v1/cleanup?min_age=0"  # removes them
+curl.exe -H $a http://127.0.0.1:5000/internal/workers/worker2/chunks   # those old copies are now "orphans"
+curl.exe -H $a -X POST "http://127.0.0.1:5000/api/v1/cleanup?min_age=0"  # removes them
 ```
 
-Don't want to wait? `curl.exe -X POST http://127.0.0.1:5000/api/v1/repair`
+Don't want to wait? `curl.exe -H $a -X POST http://127.0.0.1:5000/api/v1/repair`
 repairs at once. Restart the worker within 30 s and nothing is copied at all.
 
 **Data integrity:** damage one stored copy on purpose.
@@ -163,9 +167,10 @@ repairs at once. Restart the worker within 30 s and nothing is copied at all.
 python client.py info <object_id>                    # pick a chunk_id and one worker holding it, e.g. worker3
 docker exec object-store-worker-3 ls /data/worker3   # the chunk files
 docker exec object-store-worker-3 python -c "f=open('/data/worker3/<chunk_id>','r+b'); f.seek(10); f.write(b'XX'); f.close()"
-curl.exe http://127.0.0.1:5000/api/v1/replication    # that copy: "state": "corrupt"
+$a = "Authorization: Bearer admin-dev-key"
+curl.exe -H $a http://127.0.0.1:5000/api/v1/replication    # that copy: "state": "corrupt"
 python client.py download <object_id> check.bin     # still correct: the damaged copy is skipped
-curl.exe -X POST http://127.0.0.1:5000/api/v1/repair # the damaged copy is rebuilt from the good one
+curl.exe -H $a -X POST http://127.0.0.1:5000/api/v1/repair # the damaged copy is rebuilt from the good one
 ```
 
 Damage **both** copies of a chunk and the download fails with a clear 503
