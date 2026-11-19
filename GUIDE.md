@@ -69,7 +69,29 @@ python client.py update <object_id> "status=final,owner=null"
 python client.py delete <object_id>
 ```
 
-### b) The client containers (several clients)
+### b) The dashboards (in the terminal)
+
+```powershell
+pip install -r dashboard/requirements.txt          # once: textual + requests
+python -m dashboard --key admin-dev-key            # ADMIN: workers, chunks, copies, heartbeats, repair
+python -m dashboard --key client1-dev-key          # CLIENT client1: its own files, shared files, its history
+python -m dashboard                                # no key yet: the sign-in portal
+```
+
+In the portal, type a key, or type a name under **I am new: register** and
+press Enter. The controller creates your key and the portal shows it **once**.
+It is saved to `~\.objectstore\credentials.json`, the same file
+`python client.py register` uses, and your client dashboard opens. Next time,
+`python -m dashboard` goes straight to it. `python -m dashboard --sign-in`
+opens the portal again (to switch clients), and `--sign-out` forgets the saved
+key.
+
+In the client dashboard: `u` upload, `g` download, `d` delete, `m` metadata,
+`s` share, `a` account (your key: `v` shows it, `c` copies it), `:` commands,
+`!` a shell command, `?` help. Try it as two clients: share a file from one
+(`:share client2`) and it appears under **Shared with me** for the other.
+
+### c) The client containers (several clients)
 
 `client1` and `client2` are two separate clients (each has its own `CLIENT_ID`).
 They see this folder's `files\` as `/files`, and save downloads to
@@ -96,7 +118,7 @@ Start-Job { docker compose -f $using:PWD\docker-compose.yml run --rm -T client2 
 Get-Job | Receive-Job -Wait
 ```
 
-### c) Plain HTTP (curl)
+### d) Plain HTTP (curl)
 
 ```powershell
 $h = "Authorization: Bearer client1-dev-key"     # act as client1 (keys: docker-compose.yml)
