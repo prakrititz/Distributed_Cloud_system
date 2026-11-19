@@ -20,6 +20,12 @@ x-settings:
   worker_name:        &worker_name        ${WORKER_NAME:-worker}       # workers are called worker1, worker2, ...
   api_port:           &api_port           ${API_PORT:-5000}            # the API on this machine: http://127.0.0.1:5000
   auto_repair_grace:  &auto_repair_grace  ${AUTO_REPAIR_GRACE:-30}     # seconds a worker may be down before repair starts (0: off)
+  # Authentication: one secret key per client, and who is an admin (repair,
+  # cleanup, worker reports). These are DEVELOPMENT keys: for anything real,
+  # set API_KEYS, CLIENT1_KEY and CLIENT2_KEY in a .env file next to this one.
+  api_keys:           &api_keys           ${API_KEYS:-client1=client1-dev-key,client2=client2-dev-key,admin=admin-dev-key}
+  admins:             &admins             ${ADMINS:-admin}
+  quota_per_client:   &quota_per_client   ${QUOTA_PER_CLIENT:-0}       # bytes each client may store (0: no limit)
 # -------------------------------------------------------------------------
 #
 # How it fits together:
@@ -61,6 +67,9 @@ services:
       CHUNK_SIZE: *chunk_size
       REPLICATION_FACTOR: *replication_factor
       AUTO_REPAIR_GRACE: *auto_repair_grace
+      API_KEYS: *api_keys
+      ADMINS: *admins
+      QUOTA_PER_CLIENT: *quota_per_client
     ports:
       - target: 5000
         published: *api_port
@@ -86,6 +95,7 @@ services:
     <<: *client
     environment:
       CLIENT_ID: client1
+      API_KEY: ${CLIENT1_KEY:-client1-dev-key}
     volumes:
       - ./files:/files:ro
       - ./downloads/client1:/downloads
@@ -94,6 +104,7 @@ services:
     <<: *client
     environment:
       CLIENT_ID: client2
+      API_KEY: ${CLIENT2_KEY:-client2-dev-key}
     volumes:
       - ./files:/files:ro
       - ./downloads/client2:/downloads

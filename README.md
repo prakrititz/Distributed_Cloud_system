@@ -175,6 +175,38 @@ same source path again (409). Different clients may use the same path, and the
 same name from different folders is always fine. Uploads with no path (plain
 `curl`) are never refused.
 
+**Clients, keys and access:** with `API_KEYS` set (the Docker deployment sets
+development keys for `client1`, `client2` and `admin`), every request to
+`/api/v1` must carry `Authorization: Bearer <key>` (401 otherwise), and the
+client is whoever the key belongs to, never what the request claims. Every
+object has an owner (the client that uploaded it) and optionally readers:
+
+| Who | May |
+|---|---|
+| the owner | download, read and change the metadata, delete, choose the readers |
+| a reader (`PUT /objects/<id>/readers`) | download and read the metadata (403 for changes) |
+| an admin (`ADMINS`) | everything, including `/nodes`, `/replication`, `/repair`, `/cleanup` and a worker's chunk list (403 for others) |
+| anyone else | nothing: the object answers 404, exactly as if it did not exist, and is not listed |
+
+Without `API_KEYS` there is no authentication: everyone may do everything, as
+before. The workers' own endpoints (registration, heartbeats) need no key.
+
+**A fair share for every client:** with authentication, no client can take
+the system for itself:
+- at most `MAX_TRANSFERS_PER_CLIENT` (8) of the `MAX_TRANSFERS` (32) uploads
+  and downloads belong to one client; more get 503 with `Retry-After`, while
+  other clients still get through;
+- each client may send `RATE_PER_CLIENT` (20) requests per second, in bursts of
+  up to `RATE_BURST` (40) (a token bucket per client); more get 429 with
+  `Retry-After`;
+- each client may store `QUOTA_PER_CLIENT` bytes (0: no limit; admins have
+  none). An upload that would go over is refused with 413: at once when its
+  size is known, otherwise as soon as it passes the quota, with everything
+  stored for it deleted. Uploads running at the same time are counted
+  together, and deleting frees quota.
+
+`GET /api/v1/me` shows who the caller is, what it stores and its limits.
+
 ## Metadata
 
 `object_id`, `name`, `size`, `content_type`, `created_at`, `modified_at`,
@@ -196,35 +228,40 @@ GET /api/v1/objects/<object_id>/metadata
 
 | Method | Endpoint | Purpose | Errors |
 |---|---|---|---|
-| POST | `/api/v1/objects` | Upload, two ways (below). Optional fields: `metadata` (JSON object), `checksum`, `path`, `client_id`, `size`. 201 with the metadata | 400 bad field / checksum mismatch / upload cut off, 409 same client + path, 503 not enough room on enough live workers or `MAX_TRANSFERS` busy |
-| GET | `/api/v1/objects` | List objects; optional `limit`, `offset`; total in `X-Total-Count` | 400 |
+| POST | `/api/v1/objects` | Upload, two ways (below). Optional fields: `metadata` (JSON object), `checksum`, `path`, `client_id`, `size`. 201 with the metadata | 400 bad field / checksum mismatch / upload cut off, 403 `client_id` not the key's, 409 same client + path, 413 over the quota, 503 not enough room on enough live workers or `MAX_TRANSFERS` (or the client's share) busy |
+| GET | `/api/v1/objects` | List objects (with authentication: own and shared ones, with their `owner`); optional `limit`, `offset`; total in `X-Total-Count` | 400 |
 | GET | `/api/v1/objects/<id>` | Download, streamed: the original bytes, with the content type, `Content-Length` and an `X-Checksum` header | 404, 503 (no live copy of a chunk, or busy) |
-| GET | `/api/v1/objects/<id>/metadata` | The object's metadata | 404 |
-| PATCH | `/api/v1/objects/<id>/metadata` | Add/update custom metadata (`null` removes a key) | 400, 404 |
-| DELETE | `/api/v1/objects/<id>` | Delete the object and all copies, 204 | 404 |
-| GET | `/api/v1/nodes` | Workers: up/down, capacity, used, free, chunks, seconds since the last heartbeat | |
-| GET | `/api/v1/replication` | Health of every chunk and copy; `auto_repair` status | |
-| POST | `/api/v1/repair` | Repair now; returns what was done | 409 already running |
-| POST | `/api/v1/cleanup` | Delete orphaned copies; `?min_age=` seconds (default 60) | 400, 409 no saved metadata / repair running |
+| GET | `/api/v1/objects/<id>/metadata` | The object's metadata (`readers` shown to the owner) | 404 |
+| PATCH | `/api/v1/objects/<id>/metadata` | Add/update custom metadata (`null` removes a key). Owner only | 400, 403, 404 |
+| DELETE | `/api/v1/objects/<id>` | Delete the object and all copies, 204. Owner only | 403, 404 |
+| GET / PUT | `/api/v1/objects/<id>/readers` | Who else may read it: `{"readers": ["client2"]}` (`[]`: nobody). Owner only | 400, 403, 404 |
+| GET | `/api/v1/me` | Who the caller is, its stored bytes, quota and limits | |
+| GET | `/api/v1/nodes` | Workers: up/down, capacity, used, free, chunks, seconds since the last heartbeat. Admin | 403 |
+| GET | `/api/v1/replication` | Health of every chunk and copy; `auto_repair` status. Admin | 403 |
+| POST | `/api/v1/repair` | Repair now; returns what was done. Admin | 403, 409 already running |
+| POST | `/api/v1/cleanup` | Delete orphaned copies; `?min_age=` seconds (default 60). Admin | 400, 403, 409 no saved metadata / repair running |
 | POST | `/internal/workers/register` | Sent by a worker when it starts: `worker_id`, `url`, `capacity`, `used`, `free`, `chunks`. 201 new, 200 known | 400 |
 | POST | `/internal/workers/heartbeat` | Sent by a worker every 2 s: `worker_id`, `capacity`, `used`, `free`, `chunks` | 400, 404 not registered |
-| GET | `/internal/workers/<id>/chunks` | What the worker holds vs the metadata: `held`, `expected`, `orphans`, `in_progress`, `missing` | 404, 503 unreachable |
+| GET | `/internal/workers/<id>/chunks` | What the worker holds vs the metadata: `held`, `expected`, `orphans`, `in_progress`, `missing`. Admin | 403, 404, 503 unreachable |
 
-Errors are always JSON: `{"error": "..."}`. The workers' own endpoints
-(`/internal/chunks/...`, `/internal/health`) are used only by the controller.
+Errors are always JSON: `{"error": "..."}`. With authentication, every
+`/api/v1` request can also get 401 (no or wrong key) and 429 (too many
+requests). The workers' own endpoints (`/internal/chunks/...`,
+`/internal/health`) are used only by the controller.
 
 The two ways to upload:
 
 ```
 # multipart form, the file in the 'file' field (what curl -F and HTML forms send).
 # The web server first writes the whole upload to a temporary file, then it is read chunk by chunk.
-curl -F "file=@movie.mp4" -F 'metadata={"project": "demo"}' http://localhost:5000/api/v1/objects
+curl -H "Authorization: Bearer client1-dev-key" \
+     -F "file=@movie.mp4" -F 'metadata={"project": "demo"}' http://localhost:5000/api/v1/objects
 
 # raw: the body is the file, the fields go in the query string ('name' required),
 # Content-Type is the object's type. Chunks go to the workers while the body is arriving.
 # This is what client.py sends.
-curl -X POST -T movie.mp4 -H "Content-Type: video/mp4" \
-     "http://localhost:5000/api/v1/objects?name=movie.mp4&client_id=me"
+curl -X POST -T movie.mp4 -H "Content-Type: video/mp4" -H "Authorization: Bearer client1-dev-key" \
+     "http://localhost:5000/api/v1/objects?name=movie.mp4"
 ```
 
 ## Integrity checks (checksums)
@@ -251,6 +288,12 @@ In Docker they are at the top of `docker-compose.yml` (see [GUIDE.md](GUIDE.md))
 | `CHUNK_SIZE` | 1048576 | controller | bytes per chunk |
 | `REPLICATION_FACTOR` | 2 | controller | copies of every chunk |
 | `MAX_TRANSFERS` | 32 | controller | uploads and downloads at once; more get 503 |
+| `API_KEYS` | empty (Docker: development keys for client1, client2, admin) | controller | `client=key,...`: one secret key per client; empty = no authentication |
+| `ADMINS` | admin | controller | clients that may do everything (repair, cleanup, every object) |
+| `MAX_TRANSFERS_PER_CLIENT` | 8 | controller | uploads and downloads of one client at once (with authentication) |
+| `RATE_PER_CLIENT`, `RATE_BURST` | 20, 40 | controller | requests per second of one client, and its burst; 0 = no limit (with authentication) |
+| `QUOTA_PER_CLIENT` | 0 | controller | bytes one client may store; 0 = no limit (with authentication; admins have none) |
+| `API_KEY` | empty (Docker: the client's key) | client | the key `client.py` sends |
 | `PARALLEL_CHUNKS` | 4 | controller | chunks moving at once within one upload or download (memory: about this many chunks per transfer) |
 | `WORKER_CONNECTIONS` | 32 | controller | open connections kept per worker and reused |
 | `WORKER_THREADS` | 32 | worker | requests a worker answers at the same time (waitress threads) |
@@ -285,6 +328,7 @@ python -m pytest tests -m "not cluster"   # only the fast tests that start no se
 | `test_cleanup.py` | orphans and missing chunks, cleanup, uploads in progress left alone |
 | `test_multi_client.py` | several clients at once: same paths, races, parallel patches and deletes |
 | `test_client.py` | the client: menu, commands, original bytes on download |
+| `test_auth.py` | keys and 401, each client sees and changes only its own objects (404 for others'), sharing and readers, admin-only endpoints, the client program with a key; a fair share: per-client transfers (503), request rate (429), quota (413, also part-way and for uploads at the same time) |
 | `test_connections.py` | reused connections: one connection for many requests to a worker, many threads sharing a pool, a dead worker still noticed and a restarted one reused, a worker usable as soon as it counts as alive |
 | `test_parallel.py` | several chunks in flight: copies written at the same time, at most `PARALLEL_CHUNKS` at once, chunks finishing out of order, a failure or bad checksum with chunks in flight, downloads fetched ahead but sent in order, an abandoned download fetching nothing more |
 | `test_streaming.py` | streamed uploads and downloads: a bounded number of chunks at a time, raw uploads, checksum at the end, uploads and downloads cut off half-way, delete during a download, `MAX_TRANSFERS`, a 50 MB file in a few MB of memory |
@@ -373,6 +417,14 @@ store grows; SQLite writes only the rows a change touches. Its file is larger
 (indexes, and the write-ahead log next to it).
 
 ## Limitations
+
+- Keys travel in clear over plain HTTP, and the compose file's keys are
+  development keys: for real use, put the controller behind TLS and set
+  `API_KEYS`, `CLIENT1_KEY`, `CLIENT2_KEY` in a `.env` file.
+- The workers' endpoints (registration, heartbeats) need no key: anything that
+  can reach the controller's port can register as a worker.
+- The per-client limits apply only with authentication (without it a
+  `client_id` is just a claim).
 
 - A multipart upload (`curl -F`) is first written in full to a temporary file
   on the controller's disk by the web server; a raw upload (`client.py`) is not.
