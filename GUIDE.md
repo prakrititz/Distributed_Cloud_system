@@ -6,6 +6,41 @@ with `docker-compose.yml`).
 
 > In PowerShell, `curl` is not real curl. Always type **`curl.exe`**.
 
+### Read this first: three differences from the assignment text
+
+1. **Every `/api/v1` request needs a key.** The Docker deployment turns
+   authentication on, so a request without a key answers
+   `401 {"error": "Missing or wrong API key: send 'Authorization: Bearer <your key>'"}`.
+   Send one of these development keys (set in `docker-compose.yml`):
+
+   | Key | Who | Use it for |
+   |---|---|---|
+   | `client1-dev-key` | client `client1` | uploads, downloads, metadata, list, delete |
+   | `client2-dev-key` | client `client2` | a second, separate client |
+   | `admin-dev-key` | `admin` | everything, plus the operator endpoints: `/nodes`, `/replication`, `/repair`, `/cleanup`, `/cache`, `/internal/workers/<id>/chunks` (403 with a client key) |
+
+   ```powershell
+   curl.exe -H "Authorization: Bearer client1-dev-key" http://127.0.0.1:5000/api/v1/objects   # curl
+   $env:API_KEY = "client1-dev-key"                                                          # client.py
+   ```
+
+   `demo.py`, the dashboards (`--key`) and the client containers (`client1`,
+   `client2`) already use these keys. Each client sees only its own objects:
+   an object uploaded with one key answers **404** to another client's key.
+   The admin key sees everything.
+
+2. **The worker containers are named `object-store-worker-N`.** Where the
+   assignment says `docker stop worker2`, type
+   **`docker stop object-store-worker-2`** (and `docker start object-store-worker-2`).
+   Inside the API the workers are still called `worker1` .. `worker4`;
+   container `object-store-worker-2` is worker `worker2`. `docker compose ps`
+   lists the names.
+
+3. **Each worker stores at most 5 MB by default** (`WORKER_CAPACITY`). With
+   4 workers and 2 copies of every chunk that is about 10 MB of files in total;
+   beyond that an upload answers 503 "Not enough storage". For bigger files,
+   start with `$env:WORKER_CAPACITY=200000000; docker compose up -d` (200 MB per worker).
+
 ---
 
 ## 0. What you need
@@ -15,6 +50,14 @@ with `docker-compose.yml`).
 | the system | Docker Desktop (running), with `docker compose` |
 | the demo script and the client on this machine | Python 3.11+ and `pip install -r requirements.txt` |
 | the tests | `pip install -r requirements-dev.txt` |
+
+Get the code and go into its folder (every command below runs from there):
+
+```powershell
+git clone https://github.com/prakrititz/Distributed_Cloud_system
+cd Distributed_Cloud_system
+pip install -r requirements.txt
+```
 
 ---
 
@@ -30,6 +73,13 @@ That builds the images (the first time takes a minute) and starts:
 object-store-controller-1     the API, http://127.0.0.1:5000/api/v1
 object-store-worker-1 .. -4   the workers (not reachable from outside, only through the controller)
 ```
+
+| Container (for `docker stop`, `docker start`, `docker exec`, `docker logs`) | Worker id (in the API and the metadata) |
+|---|---|
+| `object-store-worker-1` | `worker1` |
+| `object-store-worker-2` | `worker2` |
+| `object-store-worker-3` | `worker3` |
+| `object-store-worker-4` | `worker4` |
 
 Check that it is up:
 
@@ -165,10 +215,18 @@ curl.exe -H $h http://127.0.0.1:5000/api/v1/cache                    # hits, mis
 
 ### By hand, step by step
 
+The `python client.py` commands below act as client1, so set its key first
+(once per terminal). The `<object_id>` is the one printed by your own upload:
+an object of another client answers 404.
+
+```powershell
+$env:API_KEY = "client1-dev-key"
+```
+
 **Storage + chunking + replication:** upload something larger than 1 MB.
 
 ```powershell
-fsutil file createnew files\big.bin 3500000          # a 3.5 MB file (Linux: head -c 3500000 /dev/urandom > files/big.bin)
+python -c "import os; open('files/big.bin','wb').write(os.urandom(3500000))"   # a 3.5 MB file of random bytes
 python client.py upload files\big.bin
 python client.py info <object_id>                    # 4 chunks, each "replicas": two different workers
 python client.py download <object_id> big-copy.bin
@@ -178,7 +236,8 @@ python client.py download <object_id> big-copy.bin
 **Metadata:** `upload ... "k=v"`, `info`, `update ... "k=new,old=null"`, `info`
 again. `checksum` and the data stay the same, `modified_at` changes.
 
-**Worker failure:**
+**Worker failure:** the assignment's `docker stop worker2` is
+`docker stop object-store-worker-2` here (see the table in section 1).
 
 ```powershell
 $a = "Authorization: Bearer admin-dev-key"       # these are admin endpoints
@@ -300,6 +359,10 @@ python -m pytest tests/test_auto_repair.py -v     # one file, every test name sh
 
 | Problem | Fix |
 |---|---|
+| `401 Missing or wrong API key` | send a key: `-H "Authorization: Bearer client1-dev-key"` with curl, `$env:API_KEY = "client1-dev-key"` for `client.py` (see "Read this first") |
+| `403 Only an admin may do this` | `/nodes`, `/replication`, `/repair`, `/cleanup`, `/cache` and `/internal/workers/<id>/chunks` need `admin-dev-key` |
+| `404` for an object you just uploaded | it was uploaded with another client's key: use the same key (or `admin-dev-key`), or check `$env:API_KEY` |
+| `Error: No such container: worker2` | the containers are `object-store-worker-1` .. `-4`: `docker stop object-store-worker-2` |
 | `port is already allocated` / 5000 in use | something else uses port 5000: `$env:API_PORT=5050; docker compose up -d`, then use `http://127.0.0.1:5050` (`$env:API_URL="http://127.0.0.1:5050/api/v1"` for the client and the demo) |
 | a worker never shows up in `/nodes` | `docker compose logs worker`: it prints "registered" or "not reachable, retrying" |
 | upload gives 503 "Not enough storage" | fewer than 2 live workers with room: start workers, or raise `WORKER_CAPACITY` |
