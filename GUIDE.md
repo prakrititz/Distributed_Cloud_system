@@ -289,7 +289,7 @@ except for its failure and integrity parts, which use `docker`.
 
 ```powershell
 pip install -r requirements-dev.txt
-python -m pytest tests                    # all ~380 tests, about 2 minutes, no Docker needed
+python -m pytest tests                    # all ~590 tests, about 2 minutes, no Docker needed
 python -m pytest tests -m "not cluster"   # the fast ones only (seconds)
 python -m pytest tests/test_auto_repair.py -v     # one file, every test name shown
 ```
