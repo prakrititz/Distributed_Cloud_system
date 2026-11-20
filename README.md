@@ -18,6 +18,30 @@ orphan cleanup, persistent metadata, and a Docker Compose deployment.
 
 **To run it and try everything yourself, see [GUIDE.md](GUIDE.md).**
 
+### Quick start
+
+```powershell
+git clone https://github.com/prakrititz/Distributed_Cloud_system
+cd Distributed_Cloud_system
+docker compose up --build -d                                   # 1 controller + 4 workers
+curl.exe -H "Authorization: Bearer client1-dev-key" -F "file=@files/hello.txt" http://127.0.0.1:5000/api/v1/objects
+pip install -r requirements.txt
+python demo.py                                                 # every demonstration of the assignment
+```
+
+Three things differ from the assignment's wording (details in
+[GUIDE.md](GUIDE.md#read-this-first-three-differences-from-the-assignment-text)):
+
+- **Every `/api/v1` request needs a key** (401 without one): send
+  `Authorization: Bearer client1-dev-key` (or `client2-dev-key`; `admin-dev-key`
+  for the operator endpoints). For `client.py`: `$env:API_KEY = "client1-dev-key"`.
+  Each client sees only its own objects (another client's answer 404).
+- **The worker containers are `object-store-worker-1` .. `-4`**: the
+  assignment's `docker stop worker2` is `docker stop object-store-worker-2`.
+  In the API they are still `worker1` .. `worker4`.
+- **Each worker stores at most 5 MB by default** (about 10 MB of files in all,
+  with two copies); raise it with `$env:WORKER_CAPACITY=200000000; docker compose up -d`.
+
 **On Store** is a pair of terminal dashboards. Which one opens depends on the key you sign in with:
 
 - **Admin** (a key named in `ADMINS`): every worker, every chunk and where

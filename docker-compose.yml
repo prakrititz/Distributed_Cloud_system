@@ -41,7 +41,7 @@ x-settings:
 #   - Volumes (they survive stopping, re-creating and rebuilding):
 #       worker-data      all workers; each keeps its chunks in its own folder
 #                        (/data/worker1, /data/worker2, ...)
-#       controller-data  the controller's saved metadata (/meta/metadata.json)
+#       controller-data  the controller's saved metadata (/meta/metadata.db, SQLite)
 #   - Clients (profile "clients": not started by `up`, run them when needed):
 #       client1, client2 have their own CLIENT_ID, read files from ./files
 #       and save downloads in ./downloads/client1, ./downloads/client2.
